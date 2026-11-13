@@ -6,7 +6,6 @@ import { getServiceClient } from "../db/supabase";
 import { getInstallationOctokit } from "../github/app";
 import { fetchFailedJobLogs } from "../github/logs";
 import { fingerprint } from "./fingerprint";
-import { runAgent } from "./handoff";
 import { parseJestLog } from "./parse-jest";
 import { type ErrorRecord, createErrorStore, recordError } from "./record-error";
 
@@ -79,9 +78,16 @@ export async function handleFailedRun(ctx: WorkflowRunContext): Promise<void> {
   }
 }
 
-/** Never let the agent crash ingestion. */
+/**
+ * Role 2's agent. Contract: recordError() has already inserted a `queued` fix for this error; the
+ * agent looks it up by error_id and moves it along. runAgent never throws, but guard anyway so the
+ * agent can't crash ingestion.
+ */
 async function startAgent(errorId: string): Promise<void> {
   try {
+    // Loaded on demand: keeps the agent (Anthropic SDK etc.) out of webhook requests that don't
+    // start it, and out of tests that import this module.
+    const { runAgent } = await import("../agent");
     await runAgent(errorId, { dryRun: false });
   } catch (err) {
     console.error(`ingest: runAgent failed ${JSON.stringify({ errorId })}`, err);
