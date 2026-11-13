@@ -68,7 +68,7 @@ create table public.fixes (
   red_run_url     text,
   green_run_url   text,
   ai_reasoning    text,
-  confidence      numeric,
+  confidence      numeric check (confidence between 0 and 1),  -- Role 2 treats >= 0.5 as confident
   tokens_used     integer,
   planned_changes jsonb,           -- Role 2: array of { path, search, replace }
   created_at      timestamptz not null default now(),
