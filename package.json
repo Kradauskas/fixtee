@@ -9,11 +9,13 @@
     "lint": "eslint",
     "typecheck": "next typegen && tsc --noEmit",
     "test": "vitest run --passWithNoTests",
-    "db:types": "supabase gen types --lang=typescript --remote --schema public > lib/db/types.ts"
+    "db:types": "supabase gen types --lang=typescript --remote --schema public > lib/db/types.ts",
+    "agent:pr": "tsx scripts/run-pr.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.8.0",
     "@octokit/app": "^16.1.4",
+    "@octokit/rest": "^22.0.1",
     "@octokit/webhooks": "^14.2.0",
     "@supabase/ssr": "^0.12.7",
     "@supabase/supabase-js": "^2.119.0",
@@ -31,6 +33,7 @@
     "eslint-config-next": "16.4.6",
     "supabase": "^3.1.0",
     "tailwindcss": "4.3.3",
+    "tsx": "^4.23.15",
     "typescript": "^5",
     "vitest": "^5.1.0"
   }

@@ -1,0 +1,8 @@
+{
+  "error_id": "err_001",
+  "error_message": "expect(received).toBe(expected) // Object.is equality\n\nExpected: 90\nReceived: 99.9",
+  "log_excerpt": "FAIL  src/price.test.js\n  ● applyDiscount › applies a 10% discount to 100\n\n    expect(received).toBe(expected) // Object.is equality\n\n    Expected: 90\n    Received: 99.9\n\n      at Object.<anonymous> (src/price.test.js:5:33)\n\nTests:       1 failed, 1 total",
+  "file_path": "src/price.js",
+  "line": 2,
+  "commit_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+}
