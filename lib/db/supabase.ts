@@ -13,6 +13,7 @@
 import { createServerClient } from "@supabase/ssr";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { cookies } from "next/headers";
+import { connection } from "next/server";
 import type { Database } from "./types";
 
 export type Db = SupabaseClient<Database>;
@@ -25,6 +26,10 @@ function requireEnv(name: string): string {
 
 /** Client for the current request's user. RLS applies. */
 export async function createUserClient(): Promise<Db> {
+  // Auth checks session expiry with Date.now(). With cacheComponents on, Next only allows that
+  // after an explicit request-time signal; without it the page's Suspense boundary errors and the
+  // browser retries forever. connection() marks everything after it as request-time.
+  await connection();
   const cookieStore = await cookies();
   return createServerClient<Database>(
     requireEnv("NEXT_PUBLIC_SUPABASE_URL"),
