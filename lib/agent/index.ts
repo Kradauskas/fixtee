@@ -88,8 +88,12 @@ export async function runAgent(errorId: string, { dryRun = true }: RunAgentOptio
       return;
     }
     if (!fixId) return; // failed before the fix row was created; nothing to update
-    await updateFix(fixId, patch);
-    console.log(`${tag}: fix ${fixId} -> ${patch.status ?? "(status unchanged)"}`);
+    const row = await updateFix(fixId, patch);
+    if (patch.status && row.status !== patch.status) {
+      console.log(`${tag}: fix ${fixId} stays ${row.status} (not moving back to ${patch.status})`);
+    } else {
+      console.log(`${tag}: fix ${fixId} -> ${row.status}`);
+    }
   };
 
   try {
@@ -159,15 +163,22 @@ export async function runAgent(errorId: string, { dryRun = true }: RunAgentOptio
 
     const pr = await openFixPr(output, errorId, fixId!, {
       installation,
-      onTestCommitted: ({ branch, testCommitSha }) =>
-        writeFix({ status: "test_pushed", branch_name: branch, test_commit_sha: testCommitSha }),
+      failingRunUrl: row.run_url,
+      // branch_name is stored before anything is pushed, so a crash mid-push still leaves a trace.
+      onBranchReady: ({ branch }) => writeFix({ branch_name: branch }),
+      onTestCommitted: ({ testCommitSha }) => writeFix({ status: "test_pushed", test_commit_sha: testCommitSha }),
     });
     if (!pr) throw new Error("openFixPr returned no PR.");
 
+    if (pr.testCommitSha === null) {
+      // No test commit (existing test already reproduces the error): the failing CI run is the red run.
+      console.log(`${tag}: ${output.test.file_path} unchanged; no test commit, red run = ${row.run_url}`);
+      await writeFix({ test_commit_sha: null, red_run_url: row.run_url });
+    }
+
+    // Only the PR columns; status only moves forward (verification may already be further along).
     await writeFix({
       status: "fix_pushed",
-      branch_name: pr.branch,
-      test_commit_sha: pr.testCommitSha,
       fix_commit_sha: pr.fixCommitSha,
       pr_number: pr.prNumber,
       pr_url: pr.prUrl,

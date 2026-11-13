@@ -13,9 +13,12 @@ export type ErrorProject = Pick<
 >;
 export type ErrorWithProject = ErrorRow & { projects: ErrorProject };
 
+export type FixStatus = FixRow["status"];
+
 export type FixPatch = Pick<
   TablesUpdate<"fixes">,
   | "status"
+  | "red_run_url"
   | "branch_name"
   | "pr_number"
   | "pr_url"
@@ -67,16 +70,68 @@ export async function findQueuedFix(errorId: string): Promise<FixRow | null> {
   return data;
 }
 
-/** Updates selected columns of a fixes row and returns the updated row. */
+/**
+ * Order of the fix lifecycle. Other writers (verification) move a fix forward too, so the agent
+ * only ever moves the status to a later step, never back. "failed" is terminal and is only
+ * allowed before the fix is pushed; it never replaces fix_pushed/verified.
+ */
+const STATUS_ORDER: readonly FixStatus[] = ["queued", "analyzing", "test_pushed", "test_failed", "fix_pushed", "verified"];
+
+/** Statuses from which a fix may move to `target` (strictly earlier steps; "failed" is never left). */
+export function statusesBefore(target: FixStatus): FixStatus[] {
+  if (target === "failed") return STATUS_ORDER.slice(0, STATUS_ORDER.indexOf("fix_pushed"));
+  return STATUS_ORDER.slice(0, STATUS_ORDER.indexOf(target));
+}
+
+/** True if a fix currently in `current` may be moved to `next`. */
+export function canAdvanceStatus(current: FixStatus, next: FixStatus): boolean {
+  return statusesBefore(next).includes(current);
+}
+
+/**
+ * Updates selected columns of a fixes row and returns the row as it is afterwards.
+ *
+ * Plain columns are written as given. The columns other writers also own are guarded,
+ * with the condition in the UPDATE itself so a concurrent writer cannot be overwritten:
+ * - status only moves forward (see statusesBefore); otherwise it is left as is,
+ * - red_run_url is only set while it is still empty.
+ * green_run_url is never written by the agent.
+ */
 export async function updateFix(fixId: string, patch: FixPatch): Promise<FixRow> {
-  const { data, error } = await db()
-    .from("fixes")
-    .update(patch)
-    .eq("id", fixId)
-    .select()
-    .maybeSingle();
-  if (error) throw new Error(`updateFix(${fixId}): ${error.message}`);
-  if (!data) throw new Error(`updateFix(${fixId}): fix not found`);
+  const { status, red_run_url, ...plain } = patch;
+  const fail = (msg: string) => new Error(`updateFix(${fixId}): ${msg}`);
+
+  if (Object.keys(plain).length > 0) {
+    const { data, error } = await db().from("fixes").update(plain).eq("id", fixId).select().maybeSingle();
+    if (error) throw fail(error.message);
+    if (!data) throw fail("fix not found");
+  }
+
+  if (red_run_url !== undefined) {
+    const { error } = await db()
+      .from("fixes")
+      .update({ red_run_url })
+      .eq("id", fixId)
+      .is("red_run_url", null)
+      .select()
+      .maybeSingle();
+    if (error) throw fail(error.message);
+  }
+
+  if (status !== undefined) {
+    const { error } = await db()
+      .from("fixes")
+      .update({ status })
+      .eq("id", fixId)
+      .in("status", statusesBefore(status))
+      .select()
+      .maybeSingle();
+    if (error) throw fail(error.message);
+  }
+
+  const { data, error } = await db().from("fixes").select().eq("id", fixId).maybeSingle();
+  if (error) throw fail(error.message);
+  if (!data) throw fail("fix not found");
   return data;
 }
 
