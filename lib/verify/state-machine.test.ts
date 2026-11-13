@@ -27,6 +27,8 @@ type FixRow = {
   pr_url: string | null;
   test_commit_sha: string | null;
   fix_commit_sha: string | null;
+  red_run_url: string | null;
+  green_run_url: string | null;
   errors: { projects: { repo_owner: string; repo_name: string; installation_id: number } };
 };
 
@@ -40,6 +42,8 @@ function fixRow(overrides: Partial<FixRow> = {}): FixRow {
     pr_url: "https://github.com/octo/demo/pull/42",
     test_commit_sha: TEST_SHA,
     fix_commit_sha: FIX_SHA,
+    red_run_url: null,
+    green_run_url: null,
     errors: { projects: { repo_owner: "octo", repo_name: "demo", installation_id: 7 } },
     ...overrides,
   };
@@ -85,6 +89,7 @@ function harness(
   const comments: { issue_number: number; body: string }[] = [];
   const graphqlCalls: { query: string; variables: Record<string, unknown> }[] = [];
   const routes: string[] = [];
+  const runLookups: string[] = [];
   const lookupFilters: Filter[] = [];
   const loadFilters: Filter[] = [];
 
@@ -108,6 +113,7 @@ function harness(
       routes.push(route);
       if (route.endsWith("/actions/runs")) {
         const sha = String(params.head_sha);
+        runLookups.push(sha);
         return { data: { workflow_runs: runsBySha[sha] ?? [] } };
       }
       if (route.startsWith("POST") && route.endsWith("/comments")) {
@@ -128,7 +134,16 @@ function harness(
   const deps = createVerifyDeps({ db, getClient: async () => github });
   deps.log = () => {};
 
-  return { deps, patches, comments, graphqlCalls, routes, lookupFilters, loadFilters };
+  return {
+    deps,
+    patches,
+    comments,
+    graphqlCalls,
+    routes,
+    runLookups,
+    lookupFilters,
+    loadFilters,
+  };
 }
 
 describe("decideOutcome", () => {
@@ -274,6 +289,101 @@ describe("syncFixVerification", () => {
     expect(h.patches).toEqual([]);
     expect(h.comments).toEqual([]);
     expect(h.graphqlCalls).toEqual([]);
+  });
+});
+
+describe("syncFixVerification without a test commit", () => {
+  const ORIGINAL_RED = "https://github.com/octo/demo/actions/runs/7";
+
+  const singleCommitFix = (overrides: Partial<FixRow> = {}) =>
+    fixRow({
+      status: "fix_pushed",
+      test_commit_sha: null,
+      red_run_url: ORIGINAL_RED,
+      ...overrides,
+    });
+
+  it("verifies on the fix commit alone, preserving the existing red run", async () => {
+    const h = harness(singleCommitFix(), { [FIX_SHA]: [run("success", GREEN_RUN)] });
+
+    const result = await syncFixVerification("fix-1", h.deps);
+
+    expect(result).toMatchObject({
+      status: "verified",
+      outcome: "verified",
+      testRunUrl: ORIGINAL_RED,
+      fixRunUrl: GREEN_RUN,
+      commented: true,
+      markedReadyForReview: true,
+    });
+    expect(h.patches).toEqual([{ status: "verified", green_run_url: GREEN_RUN }]);
+    expect(h.runLookups).toEqual([FIX_SHA]);
+  });
+
+  it("links the original failing run and the fix commit in the comment", async () => {
+    const h = harness(singleCommitFix(), { [FIX_SHA]: [run("success", GREEN_RUN)] });
+
+    await syncFixVerification("fix-1", h.deps);
+
+    expect(h.comments).toHaveLength(1);
+    const body = h.comments[0].body;
+    expect(body).toContain("Fixtee verified this fix");
+    expect(body).toContain("already reproduced this failure");
+    expect(body).toContain(ORIGINAL_RED);
+    expect(body).toContain(GREEN_RUN);
+    expect(body).toContain("bbbbbbb");
+    expect(body).not.toContain("aaaaaaa");
+
+    expect(h.graphqlCalls).toHaveLength(1);
+    expect(h.graphqlCalls[0].query).toContain("markPullRequestReadyForReview");
+    expect(h.graphqlCalls[0].variables).toEqual({ pullRequestId: "PR_node_42" });
+  });
+
+  it("fails and leaves the PR a draft when the fix commit is red", async () => {
+    const h = harness(singleCommitFix(), { [FIX_SHA]: [run("failure", GREEN_RUN)] });
+
+    const result = await syncFixVerification("fix-1", h.deps);
+
+    expect(result).toMatchObject({
+      status: "failed",
+      outcome: "fix_failed_ci",
+      testRunUrl: ORIGINAL_RED,
+      commented: true,
+      markedReadyForReview: false,
+    });
+    expect(h.patches).toEqual([{ status: "failed" }]);
+    expect(h.comments[0].body).toContain("could not verify this fix");
+    expect(h.comments[0].body).toContain("stays a draft");
+    expect(h.graphqlCalls).toEqual([]);
+  });
+
+  it("stays at fix_pushed while the fix commit has no finished run", async () => {
+    const h = harness(singleCommitFix());
+
+    const result = await syncFixVerification("fix-1", h.deps);
+
+    expect(result).toMatchObject({
+      status: "fix_pushed",
+      outcome: "test_reproduced",
+      testRunUrl: ORIGINAL_RED,
+      commented: false,
+      markedReadyForReview: false,
+    });
+    expect(h.patches).toEqual([]);
+    expect(h.comments).toEqual([]);
+    expect(h.graphqlCalls).toEqual([]);
+    expect(h.runLookups).toEqual([FIX_SHA]);
+  });
+
+  it("never treats a missing test commit as a guardrail failure", async () => {
+    const h = harness(singleCommitFix({ red_run_url: null }), {
+      [FIX_SHA]: [run("success", GREEN_RUN)],
+    });
+
+    const result = await syncFixVerification("fix-1", h.deps);
+
+    expect(result.status).toBe("verified");
+    expect(result.outcome).toBe("verified");
   });
 });
 
