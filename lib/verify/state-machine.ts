@@ -97,7 +97,7 @@ export async function handleAgentCiResult(
   const fix = await deps.loadFix(fixId);
   if (!fix) throw new Error(`verify: fix ${fixId} not found`);
 
-  const reusesExistingTest = fix.testCommitSha === null;
+  const reusesExistingTest = fix.testCommitSha === null && fix.fixCommitSha !== null;
   const effectiveTestConclusion: CiConclusion = reusesExistingTest ? "failure" : testConclusion;
   const effectiveTestRunUrl = reusesExistingTest ? (testRunUrl ?? fix.redRunUrl) : testRunUrl;
 
