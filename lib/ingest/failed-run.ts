@@ -1,9 +1,11 @@
 /**
  * What happens after the webhook accepts a failed CI run. Runs in the background (after()).
  * Task 5: fetch + parse the failed jobs' logs. Task 6: dedup and start the agent.
+ * Task 7: CI on the agent's own autofix/<fix_id> branches goes to Role 3's verification instead.
  */
 import { getServiceClient } from "../db/supabase";
 import { getInstallationOctokit } from "../github/app";
+import { type FixBranchRef, type VerificationResult, verifyFixByBranch } from "../verify/state-machine";
 import { fetchFailedJobLogs } from "../github/logs";
 import { fingerprint } from "./fingerprint";
 import { parseJestLog } from "./parse-jest";
@@ -94,9 +96,51 @@ async function startAgent(errorId: string): Promise<void> {
   }
 }
 
-/** autofix/* branch finished CI. Task 7 maps it to handleAgentCiResult (Role 3). */
-export async function handleAutofixRun(ctx: WorkflowRunContext): Promise<void> {
-  console.info(`ingest: autofix run received (not handled until Task 7) ${JSON.stringify(summarize(ctx))}`);
+/** autofix/<fix uuid>: the branch name the agent pushes to (fix id = fixes.id). */
+const AUTOFIX_BRANCH = /^autofix\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+export function fixIdFromBranch(branch: string | null): string | null {
+  return branch?.match(AUTOFIX_BRANCH)?.[1]?.toLowerCase() ?? null;
+}
+
+export type VerifyByBranch = (ref: FixBranchRef) => Promise<VerificationResult | null>;
+
+/**
+ * CI finished on an autofix/<fix_id> branch (any conclusion). Never creates an `errors` row.
+ * Role 3's verifyFixByBranch looks the fix up within this project, fetches the CI result of both
+ * the fix's test commit and fix commit from GitHub, and runs the red/green state machine. That
+ * makes it independent of which run's webhook arrives first, a no-op once the fix is settled, and
+ * it ignores unrelated runs on the branch (e.g. the one GitHub starts when the branch is created).
+ */
+export async function handleAutofixRun(
+  ctx: WorkflowRunContext,
+  verify: VerifyByBranch = verifyFixByBranch,
+): Promise<void> {
+  const fixId = fixIdFromBranch(ctx.headBranch);
+  if (!fixId || !ctx.headBranch) {
+    console.info(`ingest: autofix run on a malformed branch, ignored ${JSON.stringify(summarize(ctx))}`);
+    return;
+  }
+  try {
+    const result = await verify({ projectId: ctx.projectId, branchName: ctx.headBranch });
+    if (!result) {
+      console.info(`ingest: autofix run for unknown or settled fix ${JSON.stringify({ fix: fixId, run: ctx.runId })}`);
+      return;
+    }
+    console.info(
+      `ingest: fix verification ${JSON.stringify({
+        fix: fixId,
+        run: ctx.runId,
+        conclusion: ctx.conclusion,
+        outcome: result.outcome,
+        status: result.status,
+        commented: result.commented,
+        readyForReview: result.markedReadyForReview,
+      })}`,
+    );
+  } catch (err) {
+    console.error(`ingest: fix verification failed ${JSON.stringify({ fix: fixId, run: ctx.runId })}`, err);
+  }
 }
 
 /** Ids and names only: never log payloads, headers or log contents. */
