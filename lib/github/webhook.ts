@@ -264,7 +264,7 @@ export function createWebhookDeps(db: Db, runInBackground: WebhookDeps["runInBac
     onFailedRun: handleFailedRun,
     onAutofixRun: handleAutofixRun,
     runInBackground,
-    log: (message, details) => console.info(message, details ?? ""),
+    log: (message, details) => console.info(details ? `${message} ${JSON.stringify(details)}` : message),
   };
 }
 

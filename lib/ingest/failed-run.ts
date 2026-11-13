@@ -20,12 +20,12 @@ export type WorkflowRunContext = {
 };
 
 export async function handleFailedRun(ctx: WorkflowRunContext): Promise<void> {
-  console.info("ingest: failed run received", summarize(ctx));
+  console.info(`ingest: failed run received ${JSON.stringify(summarize(ctx))}`);
 }
 
 /** autofix/* branch finished CI. Task 7 maps it to handleAgentCiResult (Role 3). */
 export async function handleAutofixRun(ctx: WorkflowRunContext): Promise<void> {
-  console.info("ingest: autofix run received (not handled until Task 7)", summarize(ctx));
+  console.info(`ingest: autofix run received (not handled until Task 7) ${JSON.stringify(summarize(ctx))}`);
 }
 
 /** Ids and names only: never log payloads, headers or log contents. */
