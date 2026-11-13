@@ -10,7 +10,9 @@
  * are transformed by Vite (with the "@/" alias), while node_modules are externalized and loaded by
  * Node's native ESM loader, which resolves the "import" condition correctly.
  *
- * Needs NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and ANTHROPIC_API_KEY in .env.local / .env.
+ * Needs SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and the GitHub App vars (GITHUB_APP_ID, GITHUB_APP_SLUG,
+ * GITHUB_PRIVATE_KEY, GITHUB_WEBHOOK_SECRET) in .env.local / .env, plus ANTHROPIC_API_KEY unless the
+ * project has its own LLM key.
  */
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -18,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import { runnerImport } from "vite";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-process.chdir(root); // runAgent resolves the demo repo from process.cwd()
+process.chdir(root);
 
 const args = process.argv.slice(2);
 const real = args.includes("--real");
