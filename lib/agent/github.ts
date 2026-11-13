@@ -174,7 +174,9 @@ async function readRepoFile(octokit: GithubClient, cfg: RepoTarget, filePath: st
 /**
  * Open a draft PR with the agent's fix on a fresh `autofix/<fixId>` branch (fixId defaults to errorId):
  * commit 1 = the reproducing test only, commit 2 = the search/replace fix only.
- * If the test file already has exactly that content on the base branch, commit 1 is skipped
+ * The branch starts from hooks.commitSha (errors.commit_sha) when it is on the default branch, else from
+ * the default branch tip; the PR always targets the default branch.
+ * If the test file already has exactly that content at the base commit, commit 1 is skipped
  * (no empty commit; testCommitSha is null) and the PR says the existing test reproduces the error.
  *
  * Everything that can fail on bad agent output (paths, search text not found or ambiguous)
@@ -200,7 +202,51 @@ export type OpenFixPrHooks = {
    * When given, the PR is opened as the app on that repo; otherwise GITHUB_TOKEN + GITHUB_REPO are used.
    */
   installation?: { installationId: number; owner: string; repo: string };
+  /**
+   * The commit the error was seen on (errors.commit_sha), i.e. the code the agent read.
+   * Search/replace is checked against this commit's files, and the branch starts from it when it is
+   * already part of the default branch's history. If it is not (e.g. a commit on a feature branch), the
+   * branch starts from the default branch tip instead, and every edit must ALSO match exactly once there.
+   * If the commit cannot be read from the repo, openFixPr fails before writing anything.
+   * Omitted only by the manual script (scripts/run-pr.ts): then the default branch tip is used.
+   */
+  commitSha?: string;
 };
+
+type CommitInfo = { sha: string; treeSha: string };
+
+/** Read a commit; null when the repo does not have it (404 / 422). */
+async function getCommit(octokit: GithubClient, cfg: RepoTarget, sha: string): Promise<CommitInfo | null> {
+  try {
+    const { data } = await octokit.request("GET /repos/{owner}/{repo}/git/commits/{commit_sha}", {
+      owner: cfg.owner,
+      repo: cfg.repo,
+      commit_sha: sha,
+    });
+    return { sha: data.sha, treeSha: data.tree.sha };
+  } catch (err) {
+    const status = httpStatus(err);
+    if (status === 404 || status === 422) return null;
+    throw describeApiError(`reading commit ${sha}`, err, cfg);
+  }
+}
+
+/** True when `ancestor` is in the history of `tip` (or is `tip`). */
+async function isAncestor(octokit: GithubClient, cfg: RepoTarget, ancestor: string, tip: string): Promise<boolean> {
+  if (ancestor === tip) return true;
+  try {
+    const { data } = await octokit.request("GET /repos/{owner}/{repo}/compare/{basehead}", {
+      owner: cfg.owner,
+      repo: cfg.repo,
+      basehead: `${ancestor}...${tip}`,
+      per_page: 1,
+    });
+    // "ahead": tip has commits on top of ancestor and nothing else, i.e. ancestor is in tip's history.
+    return data.status === "ahead" || data.status === "identical";
+  } catch (err) {
+    throw describeApiError(`comparing ${ancestor.slice(0, 7)} with the default branch`, err, cfg);
+  }
+}
 
 /** Pick the client: GitHub App installation when given, else the GITHUB_TOKEN (PAT) fallback. */
 async function resolveClient(installation: OpenFixPrHooks["installation"]): Promise<{ octokit: GithubClient; cfg: RepoTarget }> {
@@ -230,10 +276,9 @@ export async function openFixPr(
   const { octokit, cfg } = await resolveClient(hooks.installation);
   const { owner, repo } = cfg;
 
-  // 1. Default branch and its latest commit. Pin everything to this exact SHA.
+  // 1. Default branch and its latest commit.
   let baseBranch: string;
-  let baseCommitSha: string;
-  let baseTreeSha: string;
+  let tip: CommitInfo;
   try {
     baseBranch = (await octokit.request("GET /repos/{owner}/{repo}", { owner, repo })).data.default_branch;
     const { data: ref } = await octokit.request("GET /repos/{owner}/{repo}/git/ref/{ref}", {
@@ -241,22 +286,42 @@ export async function openFixPr(
       repo,
       ref: `heads/${baseBranch}`,
     });
-    baseCommitSha = ref.object.sha;
-    baseTreeSha = (
-      await octokit.request("GET /repos/{owner}/{repo}/git/commits/{commit_sha}", { owner, repo, commit_sha: baseCommitSha })
-    ).data.tree.sha;
+    const tipSha = ref.object.sha;
+    tip = {
+      sha: tipSha,
+      treeSha: (await octokit.request("GET /repos/{owner}/{repo}/git/commits/{commit_sha}", { owner, repo, commit_sha: tipSha }))
+        .data.tree.sha,
+    };
   } catch (err) {
     throw describeApiError("fetching the default branch", err, cfg);
   }
+
+  // 2. The commit the agent read (errors.commit_sha). It must exist; the branch starts from it only when
+  //    it is in the default branch's history, otherwise the PR would drag in unrelated commits.
+  let source: CommitInfo = tip;
+  let base: CommitInfo = tip;
+  if (hooks.commitSha !== undefined) {
+    const wanted = hooks.commitSha.trim();
+    const found = /^[0-9a-f]{7,40}$/i.test(wanted) ? await getCommit(octokit, cfg, wanted) : null;
+    if (!found) {
+      throw new GithubFixError(
+        `The error's commit "${hooks.commitSha}" was not found in ${owner}/${repo} (it may have been force-pushed away ` +
+          "or belong to a fork). The fix cannot be checked against the code the agent read. PR not opened, nothing was written.",
+      );
+    }
+    source = found;
+    base = (await isAncestor(octokit, cfg, source.sha, tip.sha)) ? source : tip;
+  }
+  const baseCommitSha = base.sha;
+  const at = (c: CommitInfo) =>
+    c.sha === tip.sha ? `${owner}/${repo}@${baseBranch} (${c.sha.slice(0, 7)})` : `${owner}/${repo}@${c.sha.slice(0, 7)}`;
 
   // Validate and prepare both commits up front.
   const testPath = normalizeRepoPath(output.test.file_path, "test.file_path");
   if (output.changes.length === 0) {
     throw new GithubFixError("The agent output has no changes; nothing to fix. PR not opened.");
   }
-
-  const fixedFiles = new Map<string, string>(); // path -> new content
-  for (const [i, change] of output.changes.entries()) {
+  const changePaths = output.changes.map((change, i) => {
     const filePath = normalizeRepoPath(change.file_path, `changes[${i}].file_path`);
     const label = `changes[${i}] (${filePath})`;
     if (filePath === testPath) {
@@ -265,29 +330,49 @@ export async function openFixPr(
     if (change.search.length === 0) {
       throw new GithubFixError(`${label}: search text is empty. PR not opened.`);
     }
-    let content = fixedFiles.get(filePath);
-    if (content === undefined) {
-      const remote = await readRepoFile(octokit, cfg, filePath, baseCommitSha);
-      if (remote === null) {
+    return filePath;
+  });
+
+  /** Apply every search/replace to the files at `commit`; each search must match exactly once. */
+  const applyChanges = async (commit: CommitInfo, hint: string): Promise<Map<string, string>> => {
+    const files = new Map<string, string>(); // path -> new content
+    for (const [i, change] of output.changes.entries()) {
+      const filePath = changePaths[i]!;
+      const label = `changes[${i}] (${filePath})`;
+      let content = files.get(filePath);
+      if (content === undefined) {
+        const remote = await readRepoFile(octokit, cfg, filePath, commit.sha);
+        if (remote === null) {
+          throw new GithubFixError(`${label}: file does not exist in ${at(commit)}. ${hint} PR not opened.`);
+        }
+        content = remote;
+      }
+      const n = countOccurrences(content, change.search);
+      if (n !== 1) {
         throw new GithubFixError(
-          `${label}: file does not exist in ${owner}/${repo}@${baseBranch} (${baseCommitSha.slice(0, 7)}). ` +
-            (cfg.auth === "app"
-              ? "Is this project's repo the same as the local repo the agent read? PR not opened."
-              : "Is GITHUB_REPO the same project as the local repo the agent read? PR not opened."),
+          `${label}: search text found ${n} times in ${at(commit)}; it must match exactly once. ` +
+            `${n === 0 ? hint : "The search text is ambiguous."} PR not opened.`,
         );
       }
-      content = remote;
+      // Function replacer so "$&", "$1" etc. in the replacement are inserted literally.
+      files.set(filePath, content.replace(change.search, () => change.replace));
     }
-    const n = countOccurrences(content, change.search);
-    if (n !== 1) {
-      throw new GithubFixError(
-        `${label}: search text found ${n} times in ${owner}/${repo}@${baseBranch} (${baseCommitSha.slice(0, 7)}); ` +
-          `it must match exactly once. ${n === 0 ? "The GitHub file probably differs from the local copy the agent read." : "The search text is ambiguous."} ` +
-          "PR not opened.",
-      );
-    }
-    // Function replacer so "$&", "$1" etc. in the replacement are inserted literally.
-    fixedFiles.set(filePath, content.replace(change.search, () => change.replace));
+    return files;
+  };
+
+  const sameRepoHint =
+    cfg.auth === "app"
+      ? "Is this project's repo the same as the local repo the agent read?"
+      : "Is GITHUB_REPO the same project as the local repo the agent read?";
+  // Always checked against the code the agent read.
+  let fixedFiles = await applyChanges(source, `The GitHub file probably differs from the copy the agent read. ${sameRepoHint}`);
+  if (base.sha !== source.sha) {
+    // The branch starts from the default branch tip instead: the edits must apply there too, and the
+    // commit gets the tip's file contents (never the older source files, which would revert newer work).
+    fixedFiles = await applyChanges(
+      base,
+      `The error's commit ${source.sha.slice(0, 7)} is not on ${baseBranch}, and ${baseBranch} has changed this code since.`,
+    );
   }
 
   // If the test file already has exactly this content, a test commit would be empty: skip it.
@@ -344,9 +429,9 @@ export async function openFixPr(
     testCommit = await commitFiles(
       "committing the test",
       baseCommitSha,
-      baseTreeSha,
+      base.treeSha,
       new Map([[testPath, output.test.content]]),
-      `test: reproduce ${errorId}\n\nAdds a test that fails on ${baseBranch} (${baseCommitSha.slice(0, 7)}).\nGenerated by fixtee agent.`,
+      `test: reproduce ${errorId}\n\nAdds a test that fails on ${at(base)}.\nGenerated by fixtee agent.`,
     );
     await hooks.onTestCommitted?.({ branch, testCommitSha: testCommit.commitSha });
   }
@@ -355,7 +440,7 @@ export async function openFixPr(
   const fixCommit = await commitFiles(
     "committing the fix",
     testCommit?.commitSha ?? baseCommitSha,
-    testCommit?.treeSha ?? baseTreeSha,
+    testCommit?.treeSha ?? base.treeSha,
     fixedFiles,
     `fix: ${errorId}\n\n${output.root_cause}\n\nGenerated by fixtee agent.`,
   );

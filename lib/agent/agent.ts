@@ -65,18 +65,64 @@ function buildUserMessage(input: ErrorInput): string {
   ].join("\n");
 }
 
+/** Same text ignoring line endings, trailing spaces and trailing blank lines (a reformat is still a copy). */
+function sameText(a: string, b: string): boolean {
+  const norm = (s: string) => s.replace(/\r\n?/g, "\n").replace(/[ \t]+$/gm, "").trimEnd();
+  return norm(a) === norm(b);
+}
+
+/** Repo-relative POSIX path of a CI file reference, or null if it is outside the checkout. */
+function ciRepoPath(file: string): string | null {
+  const p = file
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^file:\/\//, "")
+    .replace(/^\/home\/runner\/work\/([^/]+)\/\1\//, "")
+    .replace(/^\.\//, "");
+  return p === "" || p.startsWith("/") || p.split("/").includes("..") ? null : p;
+}
+
+const STACK_FRAME = /^\s*at (?:.*? \()?(.+?):\d+:\d+\)?\s*$/;
+
+/**
+ * Does the CI error itself point into `testPath`? True when the reported location or a stack frame of
+ * the failure is in that file, i.e. a test in that file is what failed in CI. Then the existing file
+ * already reproduces the error. Anything weaker (e.g. the path merely mentioned in the log) is not enough.
+ */
+function errorPointsInto(input: ErrorInput, testPath: string): boolean {
+  const target = ciRepoPath(testPath);
+  if (!target) return false;
+  if (ciRepoPath(input.file_path) === target) return true;
+  return input.log_excerpt.split("\n").some((line) => {
+    const m = STACK_FRAME.exec(line);
+    return m !== null && ciRepoPath(m[1]!) === target;
+  });
+}
+
 /**
  * Validate a submit_fix payload beyond the zod shape: paths must be inside the repo,
+ * the test must be new (not a copy of the existing file, unless that file is the one failing in CI),
  * and every search string must occur exactly once in its target file.
  * Returns a list of problems (empty = OK).
  */
-async function checkChanges(repoRoot: string, output: AgentOutput): Promise<string[]> {
+export async function checkChanges(repoRoot: string, output: AgentOutput, input: ErrorInput): Promise<string[]> {
   const problems: string[] = [];
 
+  let testAbs: string | undefined;
   try {
-    await resolveSafePath(repoRoot, output.test.file_path);
+    testAbs = await resolveSafePath(repoRoot, output.test.file_path);
   } catch (err) {
     problems.push(`test.file_path: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (testAbs) {
+    const existing = await readFile(testAbs, "utf8").catch(() => null);
+    if (existing !== null && sameText(existing, output.test.content) && !errorPointsInto(input, output.test.file_path)) {
+      problems.push(
+        `test: content is identical to the existing ${output.test.file_path}, and the CI error does not come from a test in that file, ` +
+          "so it does not reproduce this bug. Submit a NEW regression test: add a test case for this bug (or a new " +
+          '"<name>.regression.test.ts" file) that fails on the current code and passes after your changes.',
+      );
+    }
   }
 
   if (output.changes.length === 0) problems.push("changes must contain at least one search/replace edit.");
@@ -179,7 +225,7 @@ export async function runAgent(opts: {
           });
           continue;
         }
-        const problems = await checkChanges(repoRoot, parsed.data);
+        const problems = await checkChanges(repoRoot, parsed.data, input);
         if (problems.length > 0) {
           results.push({
             type: "tool_result",
