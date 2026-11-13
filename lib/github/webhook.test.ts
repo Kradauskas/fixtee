@@ -286,6 +286,22 @@ describe("handleWebhook: real GitHub payloads", () => {
     expect(calls.autofix).toHaveLength(1);
   });
 
+  it("sends the agent's real red run (autofix/<fix_id>, failure) to the autofix handler, never to ingest", async () => {
+    const { deps, calls, flush } = fakeDeps({ projects: { "181698186:symantas/fixtee-test": PROJECT_ID } });
+    expect((await handleWebhook(deps, fixtureReq("workflow-run-completed-autofix"))).status).toBe(202);
+    await flush();
+    expect(calls.failed).toHaveLength(0);
+    expect(calls.autofix).toEqual([
+      expect.objectContaining({
+        projectId: PROJECT_ID,
+        headBranch: "autofix/f3ac06c4-8f52-4aa2-b893-2f6b407b7ba7",
+        headSha: expect.stringMatching(/^3a41415/),
+        conclusion: "failure",
+        runId: 43494474065,
+      }),
+    ]);
+  });
+
   it("answers 200 for the real payload when the repo isn't a project", async () => {
     const { deps, queued } = fakeDeps({ projects: {} });
     expect(await handleWebhook(deps, fixtureReq("workflow-run-completed-failure"))).toEqual({
