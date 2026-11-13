@@ -106,6 +106,15 @@ export function fixIdFromBranch(branch: string | null): string | null {
 export type VerifyByBranch = (ref: FixBranchRef) => Promise<VerificationResult | null>;
 
 /**
+ * GitHub's run list (status=completed) can lag the workflow_run.completed webhook by a few
+ * seconds, so verification may not see the run that just finished yet. If this run ended with a
+ * final conclusion but the fix isn't settled, look again after these delays.
+ */
+export const VERIFY_RETRY_DELAYS_MS = [5_000, 15_000];
+const SETTLED = new Set(["verified", "failed"]);
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
  * CI finished on an autofix/<fix_id> branch (any conclusion). Never creates an `errors` row.
  * Role 3's verifyFixByBranch looks the fix up within this project, fetches the CI result of both
  * the fix's test commit and fix commit from GitHub, and runs the red/green state machine. That
@@ -115,6 +124,7 @@ export type VerifyByBranch = (ref: FixBranchRef) => Promise<VerificationResult |
 export async function handleAutofixRun(
   ctx: WorkflowRunContext,
   verify: VerifyByBranch = verifyFixByBranch,
+  retryDelaysMs: number[] = VERIFY_RETRY_DELAYS_MS,
 ): Promise<void> {
   const fixId = fixIdFromBranch(ctx.headBranch);
   if (!fixId || !ctx.headBranch) {
@@ -122,7 +132,14 @@ export async function handleAutofixRun(
     return;
   }
   try {
-    const result = await verify({ projectId: ctx.projectId, branchName: ctx.headBranch });
+    const ref = { projectId: ctx.projectId, branchName: ctx.headBranch };
+    let result = await verify(ref);
+    const final = ctx.conclusion === "success" || ctx.conclusion === "failure";
+    for (const delay of final ? retryDelaysMs : []) {
+      if (!result || SETTLED.has(result.status)) break;
+      await sleep(delay);
+      result = await verify(ref);
+    }
     if (!result) {
       console.info(`ingest: autofix run for unknown or settled fix ${JSON.stringify({ fix: fixId, run: ctx.runId })}`);
       return;

@@ -60,7 +60,31 @@ describe("handleAutofixRun", () => {
   it("verifies on failure conclusions too (the red run)", async () => {
     vi.spyOn(console, "info").mockImplementation(() => {});
     const verify = vi.fn(async () => ({ ...verified, status: "fix_pushed" as const, outcome: "test_reproduced" as const }));
-    await handleAutofixRun(ctx({ conclusion: "failure" }), verify);
+    await handleAutofixRun(ctx({ conclusion: "failure" }), verify, []);
+    expect(verify).toHaveBeenCalledOnce();
+  });
+
+  it("looks again when GitHub's run list lags the webhook, until the fix settles", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const pending = { ...verified, status: "fix_pushed" as const, outcome: "test_reproduced" as const };
+    const verify = vi.fn().mockResolvedValueOnce(pending).mockResolvedValueOnce(verified);
+    await handleAutofixRun(ctx(), verify, [0, 0]);
+    expect(verify).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives up after the retry delays if the fix still isn't settled", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const pending = { ...verified, status: "fix_pushed" as const, outcome: "test_reproduced" as const };
+    const verify = vi.fn(async () => pending);
+    await handleAutofixRun(ctx(), verify, [0, 0]);
+    expect(verify).toHaveBeenCalledTimes(3);
+  });
+
+  it("doesn't retry runs without a final conclusion (e.g. cancelled)", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const pending = { ...verified, status: "fix_pushed" as const, outcome: "test_reproduced" as const };
+    const verify = vi.fn(async () => pending);
+    await handleAutofixRun(ctx({ conclusion: "cancelled" }), verify, [0, 0]);
     expect(verify).toHaveBeenCalledOnce();
   });
 
