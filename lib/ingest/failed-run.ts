@@ -82,7 +82,7 @@ export async function handleFailedRun(ctx: WorkflowRunContext): Promise<void> {
 /** Never let the agent crash ingestion. */
 async function startAgent(errorId: string): Promise<void> {
   try {
-    await runAgent(errorId);
+    await runAgent(errorId, { dryRun: false });
   } catch (err) {
     console.error(`ingest: runAgent failed ${JSON.stringify({ errorId })}`, err);
   }

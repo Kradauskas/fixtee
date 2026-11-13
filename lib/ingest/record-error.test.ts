@@ -29,6 +29,7 @@ function fakeStore() {
       );
     },
     async queueFix(errorId) {
+      if (await store.hasActiveFix(errorId)) return null; // same rule as the partial unique index
       const id = `fix-${++n}`;
       fixes.push({ id, errorId, status: "queued" });
       return id;
@@ -75,6 +76,16 @@ describe("recordError", () => {
     const again = await recordError(store, record());
     expect(again).toMatchObject({ errorId: first.errorId, isNew: false, fixId: expect.any(String) });
     expect(fixes).toHaveLength(2);
+  });
+
+  it("lost race: another run queued a fix first, so no fix and no agent start", async () => {
+    const { store, fixes } = fakeStore();
+    const first = await recordError(store, record());
+    // Simulate the race: our hasActiveFix check ran before the other run's insert landed.
+    const racing: ErrorStore = { ...store, hasActiveFix: async () => false };
+    const second = await recordError(racing, record({ workflowRunId: 2 }));
+    expect(second).toEqual({ errorId: first.errorId, isNew: false, fixId: null });
+    expect(fixes).toHaveLength(1);
   });
 
   it("different failures get separate rows and fixes", async () => {

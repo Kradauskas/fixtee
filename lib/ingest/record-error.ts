@@ -30,8 +30,11 @@ export type ErrorStore = {
   /** Bump an existing error (occurrences + 1, latest run details). Returns its id. */
   bumpError(e: ErrorRecord): Promise<string>;
   hasActiveFix(errorId: string): Promise<boolean>;
-  /** Insert the `queued` fixes row that the agent picks up. */
-  queueFix(errorId: string): Promise<string>;
+  /**
+   * Insert the `queued` fixes row that the agent picks up. Returns null if another fix for this
+   * error is already active (DB index fixes_one_active_per_error): a simultaneous run beat us.
+   */
+  queueFix(errorId: string): Promise<string | null>;
 };
 
 export type RecordResult = { errorId: string; isNew: boolean; fixId: string | null };
@@ -118,6 +121,7 @@ export function createErrorStore(db: Db): ErrorStore {
         .insert({ error_id: errorId, status: "queued" })
         .select("id")
         .single();
+      if (error?.code === UNIQUE_VIOLATION) return null;
       if (error) throw new Error(`queue fix failed: ${error.message}`);
       return data.id;
     },
