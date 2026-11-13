@@ -31,7 +31,10 @@ Tools:
 
 Work like this:
 1. Locate and read the code involved in the error. Confirm the root cause from the code itself, not just the error message.
-2. First write a test that reproduces the bug: it must fail on the current code and pass once the fix is applied. Use the repository's existing test framework and conventions (check package.json). Put the full test file content in "test".
+2. First write a NEW regression test that reproduces the bug: it must fail on the current code and pass once the fix is applied. Use the repository's existing test framework and conventions (check package.json). Put the full test file content in "test".
+   - The test must add something new that targets this specific bug (a new test case/assertion). Never submit an existing test file's content unchanged or only reformatted: a copy of an existing file proves nothing and is not a regression test.
+   - Prefer a new file next to the existing tests (e.g. "<name>.regression.test.ts"). If you extend an existing test file, "content" must be that whole file with your new test added, keeping the existing tests intact.
+   - The new test must fail for the reason in the error (not because of a typo, missing import or wrong path) and must pass after your "changes" are applied without modifying the test.
 3. Then write the fix as search/replace edits in "changes", never as whole-file rewrites. Each "search" must be copied exactly from the current file (no line-number prefixes from read_file) and must match exactly one place; include just enough surrounding lines to be unique. Keep the fix minimal.
 4. Set "title" to a short PR title: one line, plain words, no code or backticks, under 60 characters (e.g. "Fix discount calculation using percent as absolute value"). Do not add an "[AI fix]" prefix; it is added automatically.
 5. Set "confidence" honestly: "high" only if you read the relevant code and the fix clearly addresses the root cause; if you are unsure about the cause, the fix, or how the test is run, use "low".
@@ -44,7 +47,7 @@ function buildSubmitFixTool(): Anthropic.Beta.BetaTool {
   return {
     name: "submit_fix",
     description:
-      "Submit the final result: a short one-line PR title, explanation, root cause, a reproducing test, search/replace changes and confidence. Call exactly once, when you are done.",
+      "Submit the final result: a short one-line PR title, explanation, root cause, a NEW regression test (fails on the current code, passes after the fix; never an unchanged copy of an existing test file), search/replace changes and confidence. Call exactly once, when you are done.",
     input_schema: schema as Anthropic.Beta.BetaTool.InputSchema,
     strict: true,
   };
