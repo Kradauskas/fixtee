@@ -72,6 +72,20 @@ export async function createFix(errorId: string): Promise<FixRow> {
   return data;
 }
 
+/** Returns the newest fixes row for the error with status 'queued', or null if there is none. */
+export async function findQueuedFix(errorId: string): Promise<FixRow | null> {
+  const { data, error } = await db()
+    .from("fixes")
+    .select()
+    .eq("error_id", errorId)
+    .eq("status", "queued")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new Error(`findQueuedFix(${errorId}): ${error.message}`);
+  return data;
+}
+
 /** Updates selected columns of a fixes row and returns the updated row. */
 export async function updateFix(fixId: string, patch: FixPatch): Promise<FixRow> {
   const { data, error } = await db()

@@ -5,6 +5,7 @@ import {
   changesToPlannedJson,
   confidenceToNumber,
   createFix,
+  findQueuedFix,
   loadError,
   updateFix,
   type ErrorWithProject,
@@ -79,8 +80,15 @@ export async function runAgent(errorId: string, { dryRun = true }: RunAgentOptio
     if (dryRun) {
       console.log(`${tag}: would create fix (status queued) for error ${errorId}`);
     } else {
-      fixId = (await createFix(errorId)).id;
-      console.log(`${tag}: created fix ${fixId} (queued)`);
+      // Reuse the newest queued fix for this error (branch autofix/<fix.id>); otherwise create one.
+      const queued = await findQueuedFix(errorId);
+      if (queued) {
+        fixId = queued.id;
+        console.log(`${tag}: reusing queued fix ${fixId}`);
+      } else {
+        fixId = (await createFix(errorId)).id;
+        console.log(`${tag}: created fix ${fixId} (queued)`);
+      }
     }
 
     await writeFix({ status: "analyzing" });
