@@ -52,12 +52,14 @@ const FILTERS: { id: FeedFilter; label: string }[] = [
 
 export function DashboardClient({
   initialData,
+  signedIn,
   userLabel,
   notice,
   initialLoadError,
 }: {
   initialData: DashboardData;
-  userLabel: string;
+  signedIn: boolean;
+  userLabel: string | null;
   notice: string | null;
   initialLoadError: string | null;
 }) {
@@ -70,7 +72,7 @@ export function DashboardClient({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(initialLoadError);
   const [connection, setConnection] = useState(
-    initialLoadError ? "Reconnecting…" : "Live · GitHub Actions",
+    !signedIn ? "Demo · not signed in" : initialLoadError ? "Reconnecting…" : "Live · GitHub Actions",
   );
   const [running, setRunning] = useState(false);
   const [now, setNow] = useState<number | null>(null);
@@ -119,9 +121,10 @@ export function DashboardClient({
   }, []);
 
   useEffect(() => {
+    if (!signedIn) return;
     const poll = setInterval(() => void load(), POLL_INTERVAL_MS);
     return () => clearInterval(poll);
-  }, [load]);
+  }, [signedIn, load]);
 
   const requestVerify = useCallback(async (fixId: string) => {
     if (inFlight.current.has(fixId)) return;
@@ -140,10 +143,11 @@ export function DashboardClient({
   }, []);
 
   useEffect(() => {
+    if (!signedIn) return;
     for (const fix of data.fixes) {
       if (isPendingVerification(fix.status)) void requestVerify(fix.id);
     }
-  }, [data, requestVerify]);
+  }, [signedIn, data, requestVerify]);
 
   const project = useMemo(
     () => data.projects.find((row) => row.id === projectId) ?? data.projects[0] ?? null,
@@ -299,9 +303,16 @@ export function DashboardClient({
           >
             <Settings size={16} />
           </button>
-          <a className="avatar" href="/api/github/logout" title={userLabel}>
-            {userLabel.slice(0, 2).toUpperCase()}
-          </a>
+          {signedIn && userLabel ? (
+            <a className="avatar" href="/api/github/logout" title={userLabel}>
+              {userLabel.slice(0, 2).toUpperCase()}
+            </a>
+          ) : (
+            <a className="pr-button" href="/api/github/install">
+              <Github size={14} />
+              Connect GitHub
+            </a>
+          )}
         </div>
       </nav>
 
@@ -388,7 +399,9 @@ export function DashboardClient({
 
           {usingDemo && (
             <p className="settings-info">
-              No CI failures recorded yet — showing a sample so you can explore the proof view.
+              {signedIn
+                ? "No CI failures recorded yet — showing a sample so you can explore the proof view."
+                : "Demo data. Connect GitHub to catch and verify failures from your own repositories."}
             </p>
           )}
 
@@ -431,6 +444,7 @@ export function DashboardClient({
       {settingsOpen && (
         <SettingsDialog
           project={project}
+          signedIn={signedIn}
           onClose={() => setSettingsOpen(false)}
           onSaved={(message, tone) => {
             pushToast(message, tone);

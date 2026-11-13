@@ -6,10 +6,12 @@ import type { DashboardProject } from "./types";
 
 export function SettingsDialog({
   project,
+  signedIn,
   onClose,
   onSaved,
 }: {
   project: DashboardProject | null;
+  signedIn: boolean;
   onClose: () => void;
   onSaved: (message: string, tone: "success" | "warning") => void;
 }) {
@@ -83,8 +85,16 @@ export function SettingsDialog({
           <div className="settings-info">
             {project
               ? `Installation ${project.installation_id} · ${project.default_branch} branch`
-              : "Install the Fixtee GitHub App to start catching CI failures."}
+              : signedIn
+                ? "Install the Fixtee GitHub App to start catching CI failures."
+                : "Sign in and install the Fixtee GitHub App to catch failures from your own repositories."}
           </div>
+          {!project && (
+            <a className="pr-button" href="/api/github/install">
+              <Github size={14} />
+              {signedIn ? "Install the GitHub App" : "Connect GitHub / Sign in"}
+            </a>
+          )}
         </section>
 
         <section className="settings-section">
@@ -113,7 +123,7 @@ export function SettingsDialog({
           <button type="button" className="pr-button-outline" onClick={onClose}>
             Cancel
           </button>
-          <button type="button" className="pr-button" onClick={save} disabled={saving}>
+          <button type="button" className="pr-button" onClick={save} disabled={saving || !project}>
             {saving ? <Loader size={14} className="spin" /> : <ShieldCheck size={14} />}
             Save settings
           </button>

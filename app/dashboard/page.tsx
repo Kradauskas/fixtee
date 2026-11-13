@@ -1,12 +1,24 @@
 import { Suspense } from "react";
-import { redirect } from "next/navigation";
 import { DashboardClient } from "@/components/dashboard/dashboard-client";
 import { fetchDashboardData } from "@/components/dashboard/queries";
 import { EMPTY_DASHBOARD, type DashboardData } from "@/components/dashboard/types";
 import { createUserClient } from "@/lib/db/supabase";
-import { loginPath } from "@/lib/github/install";
 
 type SearchParams = Promise<Record<string, string | string[] | undefined>>;
+
+type Session = {
+  signedIn: boolean;
+  userLabel: string | null;
+  data: DashboardData;
+  loadError: string | null;
+};
+
+const SIGNED_OUT: Session = {
+  signedIn: false,
+  userLabel: null,
+  data: EMPTY_DASHBOARD,
+  loadError: null,
+};
 
 function first(value: string | string[] | undefined): string | null {
   if (Array.isArray(value)) return value[0] ?? null;
@@ -24,6 +36,38 @@ function installNotice(params: Record<string, string | string[] | undefined>): s
     return "Install requested. An organisation admin has to approve it before repositories appear.";
   }
   return null;
+}
+
+async function loadSession(): Promise<Session> {
+  let supabase;
+  try {
+    supabase = await createUserClient();
+  } catch (err) {
+    console.error("dashboard: Supabase is not configured", err instanceof Error ? err.message : err);
+    return SIGNED_OUT;
+  }
+
+  let userLabel: string;
+  try {
+    const { data: auth } = await supabase.auth.getUser();
+    if (!auth.user) return SIGNED_OUT;
+    userLabel = auth.user.email ?? auth.user.id;
+  } catch (err) {
+    console.error("dashboard: sign-in check failed", err instanceof Error ? err.message : err);
+    return SIGNED_OUT;
+  }
+
+  try {
+    return { signedIn: true, userLabel, data: await fetchDashboardData(supabase), loadError: null };
+  } catch (err) {
+    console.error("dashboard: initial load failed", err instanceof Error ? err.message : err);
+    return {
+      signedIn: true,
+      userLabel,
+      data: EMPTY_DASHBOARD,
+      loadError: "Could not load your projects. Retrying in the background.",
+    };
+  }
 }
 
 export default function DashboardPage({ searchParams }: { searchParams: SearchParams }) {
@@ -53,27 +97,16 @@ function DashboardSkeleton() {
 }
 
 async function DashboardBody({ searchParams }: { searchParams: SearchParams }) {
-  const supabase = await createUserClient();
-  const { data: auth } = await supabase.auth.getUser();
-  if (!auth.user) redirect(loginPath("/dashboard"));
-
   const params = await searchParams;
-
-  let data: DashboardData = EMPTY_DASHBOARD;
-  let loadError: string | null = null;
-  try {
-    data = await fetchDashboardData(supabase);
-  } catch (err) {
-    console.error("dashboard: initial load failed", err instanceof Error ? err.message : err);
-    loadError = "Could not load your projects. Retrying in the background.";
-  }
+  const session = await loadSession();
 
   return (
     <DashboardClient
-      initialData={data}
-      userLabel={auth.user.email ?? auth.user.id}
+      initialData={session.data}
+      signedIn={session.signedIn}
+      userLabel={session.userLabel}
       notice={installNotice(params)}
-      initialLoadError={loadError}
+      initialLoadError={session.loadError}
     />
   );
 }
