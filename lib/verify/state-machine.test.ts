@@ -375,6 +375,42 @@ describe("syncFixVerification without a test commit", () => {
     expect(h.runLookups).toEqual([FIX_SHA]);
   });
 
+  it("stays put while the agent is still analyzing and no fix commit exists", async () => {
+    const h = harness(
+      singleCommitFix({ status: "analyzing", fix_commit_sha: null, red_run_url: ORIGINAL_RED }),
+      { [FIX_SHA]: [run("success", GREEN_RUN)] },
+    );
+
+    const result = await syncFixVerification("fix-1", h.deps);
+
+    expect(result).toMatchObject({ status: "analyzing", outcome: "pending" });
+    expect(h.patches).toEqual([]);
+    expect(h.comments).toEqual([]);
+    expect(h.graphqlCalls).toEqual([]);
+    expect(h.runLookups).toEqual([]);
+  });
+
+  it("verifies through verifyFixByBranch, the path ingest uses", async () => {
+    const h = harness(singleCommitFix(), { [FIX_SHA]: [run("success", GREEN_RUN)] });
+
+    const result = await verifyFixByBranch(
+      { projectId: "project-1", branchName: "autofix/error-1" },
+      h.deps,
+    );
+
+    expect(result).toMatchObject({
+      status: "verified",
+      outcome: "verified",
+      testRunUrl: ORIGINAL_RED,
+      fixRunUrl: GREEN_RUN,
+      markedReadyForReview: true,
+    });
+    expect(h.patches).toEqual([{ status: "verified", green_run_url: GREEN_RUN }]);
+    expect(h.runLookups).toEqual([FIX_SHA]);
+    expect(h.comments[0].body).toContain(ORIGINAL_RED);
+    expect(h.comments[0].body).toContain(GREEN_RUN);
+  });
+
   it("never treats a missing test commit as a guardrail failure", async () => {
     const h = harness(singleCommitFix({ red_run_url: null }), {
       [FIX_SHA]: [run("success", GREEN_RUN)],
