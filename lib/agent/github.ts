@@ -1,5 +1,6 @@
 import { Octokit } from "@octokit/rest";
 import type { AgentOutput } from "@/lib/agent/types";
+import { getInstallationOctokit } from "@/lib/github/app";
 
 // Config comes from process.env: Next.js loads .env.local itself; scripts/run-pr.ts loads it manually.
 
@@ -31,7 +32,7 @@ export function buildPrTitle(output: AgentOutput): string {
   return PR_TITLE_PREFIX + truncateAtWord(desc, PR_TITLE_MAX - PR_TITLE_PREFIX.length);
 }
 
-export type GithubConfig ={ token: string; owner: string; repo: string };
+export type GithubConfig = { token: string; owner: string; repo: string };
 
 /** Thrown for every problem in the GitHub flow. The message says what went wrong and what to do. */
 export class GithubFixError extends Error {
@@ -75,15 +76,32 @@ function httpStatus(err: unknown): number | undefined {
     : undefined;
 }
 
+/**
+ * Works with both the GitHub App installation client (@octokit/core) and the PAT client
+ * (@octokit/rest extends core), so all calls below go through `octokit.request(route, ...)`.
+ */
+type GithubClient = Awaited<ReturnType<typeof getInstallationOctokit>>;
+
+/** Which repo to write to and how we are authenticated (only used for error hints). */
+type RepoTarget =
+  | { auth: "app"; installationId: number; owner: string; repo: string }
+  | { auth: "token"; owner: string; repo: string };
+
 /** Turn an Octokit error into a readable GithubFixError for the given step. */
-function describeApiError(step: string, err: unknown, cfg: GithubConfig): GithubFixError {
+function describeApiError(step: string, err: unknown, cfg: RepoTarget): GithubFixError {
   const status = httpStatus(err);
   const detail = err instanceof Error ? err.message : String(err);
   const repo = `${cfg.owner}/${cfg.repo}`;
   let hint = "";
-  if (status === 401) hint = "GITHUB_TOKEN is invalid or expired. Create a new token and update .env.local.";
-  else if (status === 403) hint = `The token lacks permission on ${repo}. It needs Contents and Pull requests: read & write.`;
-  else if (status === 404) hint = `Not found. Check that GITHUB_REPO=${repo} is correct and that the token has access to it.`;
+  if (cfg.auth === "app") {
+    if (status === 401) hint = `The GitHub App installation ${cfg.installationId} was rejected. Check GITHUB_APP_ID / GITHUB_PRIVATE_KEY and that the app is still installed.`;
+    else if (status === 403) hint = `The GitHub App lacks permission on ${repo}. It needs Contents and Pull requests: read & write.`;
+    else if (status === 404) hint = `Not found. Check that the project's repo ${repo} is correct and that the app installation ${cfg.installationId} has access to it.`;
+  } else {
+    if (status === 401) hint = "GITHUB_TOKEN is invalid or expired. Create a new token and update .env.local.";
+    else if (status === 403) hint = `The token lacks permission on ${repo}. It needs Contents and Pull requests: read & write.`;
+    else if (status === 404) hint = `Not found. Check that GITHUB_REPO=${repo} is correct and that the token has access to it.`;
+  }
   return new GithubFixError(`GitHub: ${step} failed${status ? ` (HTTP ${status})` : ""}: ${detail}${hint ? `\n${hint}` : ""}`);
 }
 
@@ -113,10 +131,15 @@ function countOccurrences(haystack: string, needle: string): number {
 }
 
 /** Read a UTF-8 text file from the repo at an exact commit. Returns null if it does not exist. */
-async function readRepoFile(octokit: Octokit, cfg: GithubConfig, filePath: string, ref: string): Promise<string | null> {
+async function readRepoFile(octokit: GithubClient, cfg: RepoTarget, filePath: string, ref: string): Promise<string | null> {
   let data;
   try {
-    ({ data } = await octokit.rest.repos.getContent({ owner: cfg.owner, repo: cfg.repo, path: filePath, ref }));
+    ({ data } = await octokit.request("GET /repos/{owner}/{repo}/contents/{path}", {
+      owner: cfg.owner,
+      repo: cfg.repo,
+      path: filePath,
+      ref,
+    }));
   } catch (err) {
     if (httpStatus(err) === 404) return null;
     throw describeApiError(`reading ${filePath}`, err, cfg);
@@ -128,7 +151,13 @@ async function readRepoFile(octokit: Octokit, cfg: GithubConfig, filePath: strin
   let base64 = data.content;
   if (!base64) {
     try {
-      base64 = (await octokit.rest.git.getBlob({ owner: cfg.owner, repo: cfg.repo, file_sha: data.sha })).data.content;
+      base64 = (
+        await octokit.request("GET /repos/{owner}/{repo}/git/blobs/{file_sha}", {
+          owner: cfg.owner,
+          repo: cfg.repo,
+          file_sha: data.sha,
+        })
+      ).data.content;
     } catch (err) {
       throw describeApiError(`reading blob for ${filePath}`, err, cfg);
     }
@@ -150,7 +179,29 @@ async function readRepoFile(octokit: Octokit, cfg: GithubConfig, filePath: strin
 export type OpenFixPrHooks = {
   /** Called after commit #1 (test only) is on the branch, before the fix commit. Errors propagate. */
   onTestCommitted?: (info: { branch: string; testCommitSha: string }) => Promise<void> | void;
+  /**
+   * The project's GitHub App installation (projects.installation_id / repo_owner / repo_name).
+   * When given, the PR is opened as the app on that repo; otherwise GITHUB_TOKEN + GITHUB_REPO are used.
+   */
+  installation?: { installationId: number; owner: string; repo: string };
 };
+
+/** Pick the client: GitHub App installation when given, else the GITHUB_TOKEN (PAT) fallback. */
+async function resolveClient(installation: OpenFixPrHooks["installation"]): Promise<{ octokit: GithubClient; cfg: RepoTarget }> {
+  if (installation) {
+    const cfg: RepoTarget = { auth: "app", ...installation };
+    try {
+      return { octokit: await getInstallationOctokit(installation.installationId), cfg };
+    } catch (err) {
+      throw new GithubFixError(
+        `GitHub App: could not get a client for installation ${installation.installationId}: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
+  }
+  const { token, owner, repo } = getGithubConfig();
+  return { octokit: new Octokit({ auth: token, userAgent: "fixtee-agent" }), cfg: { auth: "token", owner, repo } };
+}
 
 export async function openFixPr(
   output: AgentOutput,
@@ -160,8 +211,7 @@ export async function openFixPr(
 ): Promise<FixPrResult | null> {
   if (output.confidence === "low") return null;
 
-  const cfg = getGithubConfig();
-  const octokit = new Octokit({ auth: cfg.token, userAgent: "fixtee-agent" });
+  const { octokit, cfg } = await resolveClient(hooks.installation);
   const { owner, repo } = cfg;
 
   // 1. Default branch and its latest commit. Pin everything to this exact SHA.
@@ -169,10 +219,16 @@ export async function openFixPr(
   let baseCommitSha: string;
   let baseTreeSha: string;
   try {
-    baseBranch = (await octokit.rest.repos.get({ owner, repo })).data.default_branch;
-    const { data: ref } = await octokit.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
+    baseBranch = (await octokit.request("GET /repos/{owner}/{repo}", { owner, repo })).data.default_branch;
+    const { data: ref } = await octokit.request("GET /repos/{owner}/{repo}/git/ref/{ref}", {
+      owner,
+      repo,
+      ref: `heads/${baseBranch}`,
+    });
     baseCommitSha = ref.object.sha;
-    baseTreeSha = (await octokit.rest.git.getCommit({ owner, repo, commit_sha: baseCommitSha })).data.tree.sha;
+    baseTreeSha = (
+      await octokit.request("GET /repos/{owner}/{repo}/git/commits/{commit_sha}", { owner, repo, commit_sha: baseCommitSha })
+    ).data.tree.sha;
   } catch (err) {
     throw describeApiError("fetching the default branch", err, cfg);
   }
@@ -199,7 +255,9 @@ export async function openFixPr(
       if (remote === null) {
         throw new GithubFixError(
           `${label}: file does not exist in ${owner}/${repo}@${baseBranch} (${baseCommitSha.slice(0, 7)}). ` +
-            "Is GITHUB_REPO the same project as the local repo the agent read? PR not opened.",
+            (cfg.auth === "app"
+              ? "Is this project's repo the same as the local repo the agent read? PR not opened."
+              : "Is GITHUB_REPO the same project as the local repo the agent read? PR not opened."),
         );
       }
       content = remote;
@@ -223,7 +281,7 @@ export async function openFixPr(
   }
   const branchRef = `heads/${branch}`;
   try {
-    await octokit.rest.git.createRef({ owner, repo, ref: `refs/${branchRef}`, sha: baseCommitSha });
+    await octokit.request("POST /repos/{owner}/{repo}/git/refs", { owner, repo, ref: `refs/${branchRef}`, sha: baseCommitSha });
   } catch (err) {
     throw describeApiError(`creating branch ${branch}`, err, cfg);
   }
@@ -231,14 +289,26 @@ export async function openFixPr(
   /** Create a commit on top of `parent` and fast-forward the autofix branch to it (never force). */
   const commitFiles = async (step: string, parent: string, parentTree: string, files: Map<string, string>, message: string) => {
     try {
-      const { data: tree } = await octokit.rest.git.createTree({
+      const { data: tree } = await octokit.request("POST /repos/{owner}/{repo}/git/trees", {
         owner,
         repo,
         base_tree: parentTree,
         tree: [...files].map(([p, content]) => ({ path: p, mode: "100644" as const, type: "blob" as const, content })),
       });
-      const { data: commit } = await octokit.rest.git.createCommit({ owner, repo, message, tree: tree.sha, parents: [parent] });
-      await octokit.rest.git.updateRef({ owner, repo, ref: branchRef, sha: commit.sha, force: false });
+      const { data: commit } = await octokit.request("POST /repos/{owner}/{repo}/git/commits", {
+        owner,
+        repo,
+        message,
+        tree: tree.sha,
+        parents: [parent],
+      });
+      await octokit.request("PATCH /repos/{owner}/{repo}/git/refs/{ref}", {
+        owner,
+        repo,
+        ref: branchRef,
+        sha: commit.sha,
+        force: false,
+      });
       return { commitSha: commit.sha, treeSha: tree.sha };
     } catch (err) {
       const e = describeApiError(step, err, cfg);
@@ -285,7 +355,7 @@ export async function openFixPr(
 
   let pr;
   try {
-    ({ data: pr } = await octokit.rest.pulls.create({
+    ({ data: pr } = await octokit.request("POST /repos/{owner}/{repo}/pulls", {
       owner,
       repo,
       head: branch,

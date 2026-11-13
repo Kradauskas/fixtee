@@ -88,8 +88,12 @@ export async function runAgent(errorId: string, { dryRun = true }: RunAgentOptio
     const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
     if (!apiKey) throw new Error("ANTHROPIC_API_KEY is not set.");
 
-    // Refuse to push to a repo other than the one this error belongs to.
-    if (!dryRun) {
+    // With a GitHub App installation, the PR goes to the project's own repo (owner/name from projects).
+    // Without one we fall back to GITHUB_TOKEN + GITHUB_REPO and refuse to push to a different repo.
+    const installation = project.installation_id
+      ? { installationId: project.installation_id, owner: project.repo_owner, repo: project.repo_name }
+      : undefined;
+    if (!dryRun && !installation) {
       const gh = getGithubConfig();
       const same =
         gh.owner.toLowerCase() === project.repo_owner.toLowerCase() &&
@@ -127,6 +131,10 @@ export async function runAgent(errorId: string, { dryRun = true }: RunAgentOptio
     }
 
     if (dryRun) {
+      console.log(
+        `${tag}: would open PR on ${project.repo_owner}/${project.repo_name} via ` +
+          (installation ? `GitHub App installation ${installation.installationId}` : "GITHUB_TOKEN (PAT fallback)"),
+      );
       console.log(`${tag}: would push test commit (${output.test.file_path}) -> status test_pushed`);
       console.log(`${tag}: would push fix commit and open draft PR -> status fix_pushed`);
       console.log(`${tag}: agent output:`, JSON.stringify(output, null, 2));
@@ -134,6 +142,7 @@ export async function runAgent(errorId: string, { dryRun = true }: RunAgentOptio
     }
 
     const pr = await openFixPr(output, errorId, fixId!, {
+      installation,
       onTestCommitted: ({ branch, testCommitSha }) =>
         writeFix({ status: "test_pushed", branch_name: branch, test_commit_sha: testCommitSha }),
     });
