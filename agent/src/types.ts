@@ -1,6 +1,8 @@
 import { z } from "zod";
 
 export const AgentOutput = z.object({
+  /** Short one-line PR title (no code). Optional; github.ts falls back to a trimmed explanation. */
+  title: z.string().optional(),
   explanation: z.string(),
   root_cause: z.string(),
   test: z.object({
