@@ -4,8 +4,10 @@ import {
   createVerifyDeps,
   decideOutcome,
   handleAgentCiResult,
+  NON_TERMINAL_STATUSES,
   pickRun,
   syncFixVerification,
+  verifyFixByBranch,
   type GithubClient,
 } from "./state-machine";
 
@@ -45,17 +47,53 @@ function fixRow(overrides: Partial<FixRow> = {}): FixRow {
 
 const run = (conclusion: string | null, html_url: string): WorkflowRun => ({ conclusion, html_url });
 
-function harness(row: FixRow, runsBySha: Record<string, WorkflowRun[]> = {}) {
+type Filter = [string, unknown];
+
+type SelectBuilder = {
+  eq: (column: string, value: unknown) => SelectBuilder;
+  in: (column: string, values: unknown) => SelectBuilder;
+  order: () => SelectBuilder;
+  limit: () => SelectBuilder;
+  maybeSingle: () => Promise<{ data: unknown; error: null }>;
+};
+
+function selectBuilder(data: unknown, filters: Filter[]): SelectBuilder {
+  const builder: SelectBuilder = {
+    eq: (column, value) => {
+      filters.push([column, value]);
+      return builder;
+    },
+    in: (column, values) => {
+      filters.push([column, values]);
+      return builder;
+    },
+    order: () => builder,
+    limit: () => builder,
+    maybeSingle: async () => ({ data, error: null }),
+  };
+  return builder;
+}
+
+function harness(
+  row: FixRow | null,
+  runsBySha: Record<string, WorkflowRun[]> = {},
+  branchMatch: { id: string } | null | undefined = undefined,
+) {
+  const matchedFix = branchMatch === undefined ? (row ? { id: row.id } : null) : branchMatch;
+
   const patches: Record<string, unknown>[] = [];
   const comments: { issue_number: number; body: string }[] = [];
   const graphqlCalls: { query: string; variables: Record<string, unknown> }[] = [];
   const routes: string[] = [];
+  const lookupFilters: Filter[] = [];
+  const loadFilters: Filter[] = [];
 
   const db = {
     from: () => ({
-      select: () => ({
-        eq: () => ({ maybeSingle: async () => ({ data: row, error: null }) }),
-      }),
+      select: (columns: string) =>
+        columns.includes("errors!inner")
+          ? selectBuilder(matchedFix, lookupFilters)
+          : selectBuilder(row, loadFilters),
       update: (patch: Record<string, unknown>) => ({
         eq: async () => {
           patches.push(patch);
@@ -90,7 +128,7 @@ function harness(row: FixRow, runsBySha: Record<string, WorkflowRun[]> = {}) {
   const deps = createVerifyDeps({ db, getClient: async () => github });
   deps.log = () => {};
 
-  return { deps, patches, comments, graphqlCalls, routes };
+  return { deps, patches, comments, graphqlCalls, routes, lookupFilters, loadFilters };
 }
 
 describe("decideOutcome", () => {
@@ -236,6 +274,62 @@ describe("syncFixVerification", () => {
     expect(h.patches).toEqual([]);
     expect(h.comments).toEqual([]);
     expect(h.graphqlCalls).toEqual([]);
+  });
+});
+
+describe("verifyFixByBranch", () => {
+  it("verifies the fix that owns the branch", async () => {
+    const h = harness(fixRow(), {
+      [TEST_SHA]: [run("failure", RED_RUN)],
+      [FIX_SHA]: [run("success", GREEN_RUN)],
+    });
+
+    const result = await verifyFixByBranch(
+      { projectId: "project-1", branchName: "autofix/error-1" },
+      h.deps,
+    );
+
+    expect(result).toMatchObject({
+      status: "verified",
+      outcome: "verified",
+      markedReadyForReview: true,
+    });
+    expect(h.patches).toEqual([
+      { status: "verified", red_run_url: RED_RUN, green_run_url: GREEN_RUN },
+    ]);
+    expect(h.comments).toHaveLength(1);
+    expect(h.graphqlCalls).toHaveLength(1);
+  });
+
+  it("looks the fix up by project and branch, and only among non-terminal statuses", async () => {
+    const h = harness(fixRow(), { [TEST_SHA]: [run("failure", RED_RUN)] });
+
+    await verifyFixByBranch({ projectId: "project-1", branchName: "autofix/error-1" }, h.deps);
+
+    expect(h.lookupFilters).toContainEqual(["errors.project_id", "project-1"]);
+    expect(h.lookupFilters).toContainEqual(["branch_name", "autofix/error-1"]);
+
+    const statusFilter = h.lookupFilters.find(([column]) => column === "status");
+    expect(statusFilter).toBeDefined();
+    expect(statusFilter?.[1]).toEqual(NON_TERMINAL_STATUSES);
+    expect(NON_TERMINAL_STATUSES).not.toContain("verified");
+    expect(NON_TERMINAL_STATUSES).not.toContain("failed");
+    expect(NON_TERMINAL_STATUSES).toContain("fix_pushed");
+  });
+
+  it("returns null when no fix on that branch is awaiting verification", async () => {
+    const h = harness(fixRow(), { [TEST_SHA]: [run("failure", RED_RUN)] }, null);
+
+    const result = await verifyFixByBranch(
+      { projectId: "project-1", branchName: "autofix/already-done" },
+      h.deps,
+    );
+
+    expect(result).toBeNull();
+    expect(h.patches).toEqual([]);
+    expect(h.comments).toEqual([]);
+    expect(h.graphqlCalls).toEqual([]);
+    expect(h.routes).toEqual([]);
   });
 });
 

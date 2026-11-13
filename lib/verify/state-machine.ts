@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { getServiceClient, type Db } from "../db/supabase";
-import type { Tables, TablesUpdate } from "../db/types";
+import { Constants, type Tables, type TablesUpdate } from "../db/types";
 import { getInstallationOctokit } from "../github/app";
 
 export type FixStatus = Tables<"fixes">["status"];
@@ -51,8 +51,11 @@ export type VerificationResult = {
 
 export type FixRunUrls = { redRunUrl?: string; greenRunUrl?: string };
 
+export type FixBranchRef = { projectId: string; branchName: string };
+
 export type VerifyDeps = {
   loadFix(fixId: string): Promise<FixVerificationContext | null>;
+  findFixIdByBranch(projectId: string, branchName: string): Promise<string | null>;
   saveStatus(fixId: string, status: FixStatus, runUrls: FixRunUrls): Promise<void>;
   postPrComment(fix: FixVerificationContext, body: string): Promise<void>;
   markReadyForReview(fix: FixVerificationContext): Promise<void>;
@@ -69,6 +72,10 @@ const STATUS_BY_OUTCOME: Record<VerificationOutcome, FixStatus | null> = {
 };
 
 const SETTLED_STATUSES: ReadonlySet<FixStatus> = new Set<FixStatus>(["verified", "failed"]);
+
+export const NON_TERMINAL_STATUSES: FixStatus[] = Constants.public.Enums.fix_status.filter(
+  (status) => !SETTLED_STATUSES.has(status),
+);
 
 export function decideOutcome(
   testConclusion: CiConclusion,
@@ -160,6 +167,21 @@ export async function syncFixVerification(
     },
     { ...deps, loadFix: async () => fix },
   );
+}
+
+export async function verifyFixByBranch(
+  { projectId, branchName }: FixBranchRef,
+  deps: VerifyDeps = createVerifyDeps(),
+): Promise<VerificationResult | null> {
+  const fixId = await deps.findFixIdByBranch(projectId, branchName);
+  if (!fixId) {
+    deps.log("verify: no fix awaiting verification for this branch", {
+      project: projectId,
+      branch: branchName,
+    });
+    return null;
+  }
+  return syncFixVerification(fixId, deps);
 }
 
 function shortSha(sha: string | null): string {
@@ -342,6 +364,22 @@ export function createVerifyDeps(options: VerifyDepsOptions = {}): VerifyDeps {
       if (error) throw new Error(`verify: loading fix ${fixId} failed: ${error.message}`);
       if (!data) return null;
       return toVerificationContext(data);
+    },
+
+    async findFixIdByBranch(projectId, branchName) {
+      const { data, error } = await db
+        .from("fixes")
+        .select("id, created_at, errors!inner(project_id)")
+        .eq("errors.project_id", projectId)
+        .eq("branch_name", branchName)
+        .in("status", NON_TERMINAL_STATUSES)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) {
+        throw new Error(`verify: looking up a fix for ${branchName} failed: ${error.message}`);
+      }
+      return data?.id ?? null;
     },
 
     async saveStatus(fixId, status, runUrls) {
