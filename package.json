@@ -7,8 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "typecheck": "next typegen && tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
     "db:types": "supabase gen types --lang=typescript --remote --schema public > lib/db/types.ts"
   },
   "dependencies": {
