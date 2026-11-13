@@ -1,0 +1,9 @@
+{
+  "parsed": true,
+  "testName": "cartTotal › subtracts the discount",
+  "errorType": "AssertionError",
+  "errorMessage": "expect(received).toBe(expected) // Object.is equality\n\nExpected: 15\nReceived: 25",
+  "filePath": "src/cart.test.js",
+  "line": 9,
+  "logExcerpt": "  ● cartTotal › subtracts the discount\n\n    expect(received).toBe(expected) // Object.is equality\n\n    Expected: 15\n    Received: 25\n\n       7 |\n       8 |   it(\"subtracts the discount\", () => {\n    >  9 |     expect(cartTotal([{ price: 10, qty: 2 }], 5)).toBe(15);\n         |                                                   ^\n      10 |   });\n      11 | });\n      12 |\n\n      at Object.toBe (src/cart.test.js:9:51)"
+}

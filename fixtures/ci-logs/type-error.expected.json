@@ -1,0 +1,9 @@
+{
+  "parsed": true,
+  "testName": "formatPrice › handles a missing amount",
+  "errorType": "TypeError",
+  "errorMessage": "Cannot read properties of undefined (reading 'toFixed')",
+  "filePath": "src/format.js",
+  "line": 3,
+  "logExcerpt": "  ● formatPrice › handles a missing amount\n\n    TypeError: Cannot read properties of undefined (reading 'toFixed')\n\n      1 | // Formats a price object. Bug on purpose: crashes when amount is missing.\n      2 | function formatPrice(price) {\n    > 3 |   return \"$\" + price.amount.toFixed(2);\n        |                             ^\n      4 | }\n      5 |\n      6 | module.exports = { formatPrice };\n\n      at toFixed (src/format.js:3:29)\n      at Object.formatPrice (src/format.test.js:9:12)"
+}

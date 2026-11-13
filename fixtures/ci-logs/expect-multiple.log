@@ -1,0 +1,217 @@
+2026-11-13T15:18:53.0452583Z Current runner version: '2.338.2'
+2026-11-13T15:18:53.0471568Z ##[group]Runner Image Provisioner
+2026-11-13T15:18:53.0472236Z Hosted Compute Agent
+2026-11-13T15:18:53.0472711Z Version: 20261103.629
+2026-11-13T15:18:53.0473160Z Commit: 15dbd9ccb5dbf34fae002b6ed1a2670f52df37bc
+2026-11-13T15:18:53.0473739Z Build Date: 2026-11-03T17:26:59Z
+2026-11-13T15:18:53.0474237Z Worker ID: {b3d6aee1-e2f6-485a-86c6-e4348f0f622a}
+2026-11-13T15:18:53.0474780Z Region: us-west-2
+2026-11-13T15:18:53.0475197Z Cloud: AWS
+2026-11-13T15:18:53.0475576Z ##[endgroup]
+2026-11-13T15:18:53.0476534Z ##[group]Operating System
+2026-11-13T15:18:53.0476977Z Ubuntu
+2026-11-13T15:18:53.0477360Z 26.04.1
+2026-11-13T15:18:53.0477732Z LTS
+2026-11-13T15:18:53.0478094Z ##[endgroup]
+2026-11-13T15:18:53.0478496Z ##[group]Runner Image
+2026-11-13T15:18:53.0478986Z Image: ubuntu-26.04
+2026-11-13T15:18:53.0479426Z Version: 20261111.82.6
+2026-11-13T15:18:53.0480410Z Included Software: https://github.com/actions/runner-images/blob/ubuntu26/20261111.82/images/ubuntu/Ubuntu2604-Readme.md
+2026-11-13T15:18:53.0481730Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu26%2F20261111.82
+2026-11-13T15:18:53.0482496Z ##[endgroup]
+2026-11-13T15:18:53.0483357Z ##[group]GITHUB_TOKEN Permissions
+2026-11-13T15:18:53.0485195Z Contents: read
+2026-11-13T15:18:53.0485606Z Metadata: read
+2026-11-13T15:18:53.0486015Z Packages: read
+2026-11-13T15:18:53.0486443Z ##[endgroup]
+2026-11-13T15:18:53.0488176Z Secret source: Actions
+2026-11-13T15:18:53.0488826Z Cache mode: write
+2026-11-13T15:18:53.0489345Z Prepare workflow directory
+2026-11-13T15:18:53.0718494Z Prepare all required actions
+2026-11-13T15:18:53.0755373Z Getting action download info
+2026-11-13T15:18:53.4477964Z Download action repository 'actions/checkout@v4' (SHA:11d5960a326750d5838078e36cf38b85af677262)
+2026-11-13T15:18:55.9671727Z Download action repository 'actions/setup-node@v4' (SHA:49933ea5288caeca8642d1e84afbd3f7d6820020)
+2026-11-13T15:18:56.3279761Z Complete job name: test
+2026-11-13T15:18:56.3972726Z ##[group]Run actions/checkout@v4
+2026-11-13T15:18:56.3973791Z with:
+2026-11-13T15:18:56.3974477Z   repository: mikutisaurimas/fixtee-demos
+2026-11-13T15:18:56.3980796Z   token: ***
+2026-11-13T15:18:56.3981629Z   ssh-strict: true
+2026-11-13T15:18:56.3982294Z   ssh-user: git
+2026-11-13T15:18:56.3983012Z   persist-credentials: true
+2026-11-13T15:18:56.3983746Z   clean: true
+2026-11-13T15:18:56.3984430Z   sparse-checkout-cone-mode: true
+2026-11-13T15:18:56.3985277Z   fetch-depth: 1
+2026-11-13T15:18:56.3985933Z   fetch-tags: false
+2026-11-13T15:18:56.3986626Z   show-progress: true
+2026-11-13T15:18:56.3987343Z   lfs: false
+2026-11-13T15:18:56.3987987Z   submodules: false
+2026-11-13T15:18:56.3988691Z   set-safe-directory: true
+2026-11-13T15:18:56.3989449Z   allow-unsafe-pr-checkout: false
+2026-11-13T15:18:56.3990398Z ##[endgroup]
+2026-11-13T15:18:59.5816001Z Syncing repository: mikutisaurimas/fixtee-demos
+2026-11-13T15:18:59.5817912Z ##[group]Getting Git version info
+2026-11-13T15:18:59.5818677Z Working directory is '/home/runner/work/fixtee-demos/fixtee-demos'
+2026-11-13T15:18:59.5819636Z [command]/usr/bin/git version
+2026-11-13T15:18:59.5820706Z git version 2.56.1
+2026-11-13T15:18:59.5834441Z ##[endgroup]
+2026-11-13T15:18:59.5845455Z Temporarily overriding HOME='/home/runner/work/_temp/a6956fdb-6173-448a-8b14-b171335e4b78' before making global git config changes
+2026-11-13T15:18:59.5846609Z Adding repository directory to the temporary git global config as a safe directory
+2026-11-13T15:18:59.5848849Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/fixtee-demos/fixtee-demos
+2026-11-13T15:18:59.5926535Z Deleting the contents of '/home/runner/work/fixtee-demos/fixtee-demos'
+2026-11-13T15:18:59.5929732Z ##[group]Initializing the repository
+2026-11-13T15:18:59.5933522Z [command]/usr/bin/git init /home/runner/work/fixtee-demos/fixtee-demos
+2026-11-13T15:18:59.6371543Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-11-13T15:18:59.6372497Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-11-13T15:18:59.6373462Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-11-13T15:18:59.6374060Z hint: call:
+2026-11-13T15:18:59.6374395Z hint:
+2026-11-13T15:18:59.6374847Z hint: 	git config --global init.defaultBranch <name>
+2026-11-13T15:18:59.6375272Z hint:
+2026-11-13T15:18:59.6375701Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-11-13T15:18:59.6376375Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-11-13T15:18:59.6376887Z hint:
+2026-11-13T15:18:59.6377218Z hint: 	git branch -m <name>
+2026-11-13T15:18:59.6377641Z hint:
+2026-11-13T15:18:59.6378099Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-11-13T15:18:59.6398399Z Initialized empty Git repository in /home/runner/work/fixtee-demos/fixtee-demos/.git/
+2026-11-13T15:18:59.6408447Z [command]/usr/bin/git remote add origin https://github.com/mikutisaurimas/fixtee-demos
+2026-11-13T15:18:59.6473662Z ##[endgroup]
+2026-11-13T15:18:59.6474159Z ##[group]Disabling automatic garbage collection
+2026-11-13T15:18:59.6477038Z [command]/usr/bin/git config --local gc.auto 0
+2026-11-13T15:18:59.6498632Z ##[endgroup]
+2026-11-13T15:18:59.6499100Z ##[group]Setting up auth
+2026-11-13T15:18:59.6512101Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-11-13T15:18:59.6530846Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-11-13T15:18:59.9818717Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-11-13T15:18:59.9841679Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-11-13T15:19:00.0018727Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-11-13T15:19:00.0043971Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-11-13T15:19:00.0215389Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-11-13T15:19:00.0257245Z ##[endgroup]
+2026-11-13T15:19:00.0257741Z ##[group]Fetching the repository
+2026-11-13T15:19:00.0258669Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +6feec048527d2e3f6d27774ad3ecbc6559d4f1f6:refs/remotes/origin/main
+2026-11-13T15:19:00.4797617Z From https://github.com/mikutisaurimas/fixtee-demos
+2026-11-13T15:19:00.4798394Z  * [new ref]         6feec048527d2e3f6d27774ad3ecbc6559d4f1f6 -> origin/main
+2026-11-13T15:19:00.4809845Z ##[endgroup]
+2026-11-13T15:19:00.4810440Z ##[group]Determining the checkout info
+2026-11-13T15:19:00.4811285Z ##[endgroup]
+2026-11-13T15:19:00.4811713Z [command]/usr/bin/git sparse-checkout disable
+2026-11-13T15:19:00.4859320Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-11-13T15:19:00.4879694Z ##[group]Checking out the ref
+2026-11-13T15:19:00.4883496Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2026-11-13T15:19:00.4945140Z Switched to a new branch 'main'
+2026-11-13T15:19:00.4954915Z branch 'main' set up to track 'origin/main'.
+2026-11-13T15:19:00.4961557Z ##[endgroup]
+2026-11-13T15:19:00.4999790Z [command]/usr/bin/git log -1 --format=%H
+2026-11-13T15:19:00.5016267Z 6feec048527d2e3f6d27774ad3ecbc6559d4f1f6
+2026-11-13T15:19:00.5231408Z ##[group]Run actions/setup-node@v4
+2026-11-13T15:19:00.5231728Z with:
+2026-11-13T15:19:00.5231950Z   node-version: 20
+2026-11-13T15:19:00.5232189Z   always-auth: false
+2026-11-13T15:19:00.5232425Z   check-latest: false
+2026-11-13T15:19:00.5234391Z   token: ***
+2026-11-13T15:19:00.5234618Z ##[endgroup]
+2026-11-13T15:19:00.8347838Z Attempting to download 20...
+2026-11-13T15:19:00.8531935Z (node:2362) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-13T15:19:00.8532556Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-13T15:19:01.5256448Z Acquiring 20.20.2 - x64 from https://github.com/actions/node-versions/releases/download/20.20.2-23521894959/node-20.20.2-linux-x64.tar.gz
+2026-11-13T15:19:02.1616525Z Extracting ...
+2026-11-13T15:19:02.1737828Z [command]/usr/bin/tar xz --strip 1 --warning=no-unknown-keyword --overwrite -C /home/runner/work/_temp/6d2256ca-0a07-4b60-b9f7-e87b9737f255 -f /home/runner/work/_temp/49d2f908-31a7-42bb-954c-93235e6eb5e7
+2026-11-13T15:19:02.6792265Z Adding to the cache ...
+2026-11-13T15:19:03.4971572Z ##[group]Environment details
+2026-11-13T15:19:04.0237446Z node: v20.20.2
+2026-11-13T15:19:04.0238002Z npm: 10.8.2
+2026-11-13T15:19:04.0238259Z yarn: 1.22.22
+2026-11-13T15:19:04.0238897Z ##[endgroup]
+2026-11-13T15:19:04.0361953Z ##[group]Run npm install
+2026-11-13T15:19:04.0362322Z [36;1mnpm install[0m
+2026-11-13T15:19:04.0386371Z shell: /usr/bin/bash -e {0}
+2026-11-13T15:19:04.0386663Z ##[endgroup]
+2026-11-13T15:19:10.0992286Z npm warn deprecated inflight@1.0.6: This module is not supported, and leaks memory. Do not use it. Check out lru-cache if you want a good and tested way to coalesce async requests by a key value, which is much more comprehensive and powerful.
+2026-11-13T15:19:10.2670393Z npm warn deprecated glob@7.2.3: Old versions of glob are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
+2026-11-13T15:19:10.8209694Z 
+2026-11-13T15:19:10.8210820Z added 267 packages, and audited 268 packages in 7s
+2026-11-13T15:19:10.8211490Z 
+2026-11-13T15:19:10.8211737Z 32 packages are looking for funding
+2026-11-13T15:19:10.8212264Z   run `npm fund` for details
+2026-11-13T15:19:10.8305936Z 
+2026-11-13T15:19:10.8307051Z 6 low severity vulnerabilities
+2026-11-13T15:19:10.8307372Z 
+2026-11-13T15:19:10.8307742Z To address issues that do not require attention, run:
+2026-11-13T15:19:10.8308298Z   npm audit fix
+2026-11-13T15:19:10.8308502Z 
+2026-11-13T15:19:10.8308769Z To address all issues (including breaking changes), run:
+2026-11-13T15:19:10.8309238Z   npm audit fix --force
+2026-11-13T15:19:10.8309470Z 
+2026-11-13T15:19:10.8309716Z Run `npm audit` for details.
+2026-11-13T15:19:10.8444705Z ##[group]Run npm test
+2026-11-13T15:19:10.8444987Z [36;1mnpm test[0m
+2026-11-13T15:19:10.8462807Z shell: /usr/bin/bash -e {0}
+2026-11-13T15:19:10.8463089Z ##[endgroup]
+2026-11-13T15:19:10.9288034Z 
+2026-11-13T15:19:10.9288749Z > demo-repo@1.0.0 test
+2026-11-13T15:19:10.9289088Z > jest
+2026-11-13T15:19:10.9289345Z 
+2026-11-13T15:19:11.3873546Z FAIL src/price.test.js
+2026-11-13T15:19:11.3874171Z   applyDiscount
+2026-11-13T15:19:11.3876592Z     ✕ applyDiscount(100, 10) = 90 (2 ms)
+2026-11-13T15:19:11.3877193Z     ✕ applyDiscount(80, 50) = 40
+2026-11-13T15:19:11.3877758Z     ✓ applyDiscount(100, 0) = 100
+2026-11-13T15:19:11.3878045Z 
+2026-11-13T15:19:11.3878447Z   ● applyDiscount › applyDiscount(100, 10) = 90
+2026-11-13T15:19:11.3878678Z 
+2026-11-13T15:19:11.3879048Z     expect(received).toBe(expected) // Object.is equality
+2026-11-13T15:19:11.3879316Z 
+2026-11-13T15:19:11.3879412Z     Expected: 90
+2026-11-13T15:19:11.3879691Z     Received: 99.9
+2026-11-13T15:19:11.3879805Z 
+2026-11-13T15:19:11.3880361Z     [0m [90m 3 |[39m describe([32m'applyDiscount'[39m[33m,[39m () [33m=>[39m {
+2026-11-13T15:19:11.3881347Z      [90m 4 |[39m   test([32m'applyDiscount(100, 10) = 90'[39m[33m,[39m () [33m=>[39m {
+2026-11-13T15:19:11.3882306Z     [31m[1m>[22m[39m[90m 5 |[39m     expect(applyDiscount([35m100[39m[33m,[39m [35m10[39m))[33m.[39mtoBe([35m90[39m)[33m;[39m
+2026-11-13T15:19:11.3883082Z      [90m   |[39m                                    [31m[1m^[22m[39m
+2026-11-13T15:19:11.3883928Z      [90m 6 |[39m   })[33m;[39m
+2026-11-13T15:19:11.3884299Z      [90m 7 |[39m
+2026-11-13T15:19:11.3884908Z      [90m 8 |[39m   test([32m'applyDiscount(80, 50) = 40'[39m[33m,[39m () [33m=>[39m {[0m
+2026-11-13T15:19:11.3885272Z 
+2026-11-13T15:19:11.3885482Z       at Object.toBe (src/price.test.js:5:36)
+2026-11-13T15:19:11.3885759Z 
+2026-11-13T15:19:11.3886072Z   ● applyDiscount › applyDiscount(80, 50) = 40
+2026-11-13T15:19:11.3886327Z 
+2026-11-13T15:19:11.3886668Z     expect(received).toBe(expected) // Object.is equality
+2026-11-13T15:19:11.3886973Z 
+2026-11-13T15:19:11.3887100Z     Expected: 40
+2026-11-13T15:19:11.3887466Z     Received: 79.5
+2026-11-13T15:19:11.3887654Z 
+2026-11-13T15:19:11.3887855Z     [0m [90m  7 |[39m
+2026-11-13T15:19:11.3888457Z      [90m  8 |[39m   test([32m'applyDiscount(80, 50) = 40'[39m[33m,[39m () [33m=>[39m {
+2026-11-13T15:19:11.3889413Z     [31m[1m>[22m[39m[90m  9 |[39m     expect(applyDiscount([35m80[39m[33m,[39m [35m50[39m))[33m.[39mtoBe([35m40[39m)[33m;[39m
+2026-11-13T15:19:11.3890223Z      [90m    |[39m                                   [31m[1m^[22m[39m
+2026-11-13T15:19:11.3890780Z      [90m 10 |[39m   })[33m;[39m
+2026-11-13T15:19:11.3891452Z      [90m 11 |[39m
+2026-11-13T15:19:11.3892105Z      [90m 12 |[39m   test([32m'applyDiscount(100, 0) = 100'[39m[33m,[39m () [33m=>[39m {[0m
+2026-11-13T15:19:11.3892552Z 
+2026-11-13T15:19:11.3892751Z       at Object.toBe (src/price.test.js:9:35)
+2026-11-13T15:19:11.3893041Z 
+2026-11-13T15:19:11.3893391Z Test Suites: 1 failed, 1 total
+2026-11-13T15:19:11.3893878Z Tests:       2 failed, 1 passed, 3 total
+2026-11-13T15:19:11.3894271Z Snapshots:   0 total
+2026-11-13T15:19:11.3894605Z Time:        0.206 s
+2026-11-13T15:19:11.3894964Z Ran all test suites.
+2026-11-13T15:19:11.4017796Z ##[error]Process completed with exit code 1.
+2026-11-13T15:19:11.4128207Z Post job cleanup.
+2026-11-13T15:19:11.4776037Z [command]/usr/bin/git version
+2026-11-13T15:19:11.4806629Z git version 2.56.1
+2026-11-13T15:19:11.4831511Z Temporarily overriding HOME='/home/runner/work/_temp/a2b32f49-9e71-40fa-876f-18952c8e5d51' before making global git config changes
+2026-11-13T15:19:11.4832841Z Adding repository directory to the temporary git global config as a safe directory
+2026-11-13T15:19:11.4834155Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/fixtee-demos/fixtee-demos
+2026-11-13T15:19:11.4865137Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-11-13T15:19:11.4888696Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-11-13T15:19:11.5072585Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-11-13T15:19:11.5087517Z http.https://github.com/.extraheader
+2026-11-13T15:19:11.5094165Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-11-13T15:19:11.5115764Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-11-13T15:19:11.5311829Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-11-13T15:19:11.5329615Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-11-13T15:19:11.5611937Z Cleaning up orphan processes
+2026-11-13T15:19:11.5869623Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4, actions/setup-node@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
