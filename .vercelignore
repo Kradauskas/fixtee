@@ -1,0 +1,10 @@
+# Never upload local env files or local-only notes to Vercel.
+.env*
+!.env.example
+.vercel
+CLAUDE.md
+docs/claude
+.next
+node_modules
+
+.fixtee-dev-tmp
