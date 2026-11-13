@@ -208,13 +208,59 @@ Troubleshooting:
 - Signature checks fail **only** through smee: compare with a delivery to the deployed URL. smee
   re-serialises the JSON body, so in rare cases the bytes differ from what GitHub signed.
 
-## 7. Switching to the deployed app
+## 7. Deploy to Vercel (production app)
 
-When Vercel is up, change on the app's General page:
-- Webhook URL → `https://<deploy url>/api/github/webhook`
-- Setup URL → `https://<deploy url>/api/github/setup`
-- Supabase redirect URLs → add `https://<deploy url>/api/github/auth/callback`
-- Supabase Site URL → `https://<deploy url>`
+Two apps, one Supabase project:
 
-There is one webhook URL per app, so while it points at Vercel, smee (local) gets nothing. If both are
-needed at once, create a second "dev" app with its own env vars.
+| App | Webhook URL | Setup URL | Installed on |
+|-----|-------------|-----------|--------------|
+| `fixtee-bot` (production) | `https://<deploy url>/api/github/webhook` | `https://<deploy url>/api/github/setup` | demo repos, `Kradauskas/fixtee` |
+| `fixtee-bot-dev` (local) | your smee channel | `http://localhost:3000/api/github/setup` | `Symantas/fixtee-test` only |
+
+**Install each repo on only one of the two apps.** Both write to the same database, so a repo on both
+apps gets every failed run handled twice.
+
+We deploy with the Vercel CLI from a laptop (the repo belongs to a teammate, so no Vercel Git
+integration). Every deploy is manual: rerun `npx vercel --prod` after merging to `main`.
+
+1. Log in and link (from the repo root, on an up-to-date `main`):
+   ```bash
+   npx vercel login
+   npx vercel link --yes --project fixtee
+   ```
+   `.vercel/` is gitignored.
+2. Add the production env vars from `.env.local` (run this **while `.env.local` still holds the
+   production app's values**). Values go through stdin and are never printed:
+   ```bash
+   for k in GITHUB_APP_ID GITHUB_APP_SLUG GITHUB_PRIVATE_KEY GITHUB_WEBHOOK_SECRET \
+            SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY; do
+     grep -m1 "^$k=" .env.local | cut -d= -f2- | tr -d '\r\n' | npx vercel env add "$k" production
+   done
+   npx vercel env ls production
+   ```
+   `GITHUB_PRIVATE_KEY` is the same single-line base64 value as locally. Add `ANTHROPIC_API_KEY` the
+   same way once the agent is wired in. `NEXT_PUBLIC_*` values are baked in at build time, so add them
+   before the first deploy (or redeploy after changing them).
+3. Deploy: `npx vercel --prod`. Note the production URL (`https://<project>.vercel.app`).
+4. On `fixtee-bot`'s General page: Webhook URL and Setup URL as in the table above, Homepage URL =
+   the deploy URL. Keep "Redirect on update" on.
+5. Supabase → Authentication → URL Configuration: Site URL = the deploy URL; add
+   `https://<deploy url>/api/github/auth/callback` to Redirect URLs (keep the localhost one).
+6. Check: on the app's Advanced tab, redeliver a recent delivery → Vercel logs
+   (`npx vercel logs <deploy url>`) show a `webhook:` line; redelivering the same one again is
+   ignored as a duplicate.
+
+## 8. Dev app for local work
+
+The production app's webhook now goes to Vercel, so local development needs its own app.
+
+1. Before switching: with `npm run dev` + smee still running, remove the dev repos (e.g.
+   `fixtee-test`) from the production app's installation, so their `projects` rows are deleted.
+2. New smee channel (https://smee.io/new), then create `fixtee-bot-dev` exactly like section 2, with
+   Webhook URL = the smee channel, Setup URL = `http://localhost:3000/api/github/setup`, a new
+   webhook secret, "Only on this account".
+3. Generate its private key and put the dev app's `GITHUB_APP_ID`, `GITHUB_APP_SLUG`,
+   `GITHUB_PRIVATE_KEY` (base64) and `GITHUB_WEBHOOK_SECRET` into `.env.local`. The production values
+   now live only in Vercel.
+4. Run smee + `npm run dev`, open `http://localhost:3000/api/github/install`, install on the dev repos
+   only. You land on `/dashboard?installed=<n>`.
