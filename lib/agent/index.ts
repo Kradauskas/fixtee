@@ -163,6 +163,8 @@ export async function runAgent(errorId: string, { dryRun = true }: RunAgentOptio
 
     const pr = await openFixPr(output, errorId, fixId!, {
       installation,
+      // Check the edits against, and branch from, the commit the agent actually read.
+      commitSha: input.commit_sha,
       failingRunUrl: row.run_url,
       // branch_name is stored before anything is pushed, so a crash mid-push still leaves a trace.
       onBranchReady: ({ branch }) => writeFix({ branch_name: branch }),
