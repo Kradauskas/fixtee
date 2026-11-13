@@ -8,7 +8,7 @@ Two different people are involved:
 
 | Who | Does what |
 |-----|-----------|
-| **App owner** (you) | Creates the app on his own GitHub account, keeps the private key, sets env vars |
+| **App owner** (you) | Creates the app on their own GitHub account, keeps the private key, sets env vars |
 | **Repo owner** (Kradauskas, the teammate who owns `Kradauskas/fixtee`) | Installs the app on his repos. Only the owner of a personal-account repo can install an app on it; collaborators can't |
 
 ---
