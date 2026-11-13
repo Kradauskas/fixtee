@@ -6,3 +6,5 @@ CLAUDE.md
 docs/claude
 .next
 node_modules
+
+.fixtee-dev-tmp
