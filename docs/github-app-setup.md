@@ -9,7 +9,7 @@ Two different people are involved:
 | Who | Does what |
 |-----|-----------|
 | **App owner** (you) | Creates the app on their own GitHub account, keeps the private key, sets env vars |
-| **Repo owner** (Kradauskas, the teammate who owns `Kradauskas/fixtee`) | Installs the app on his repos. Only the owner of a personal-account repo can install an app on it; collaborators can't |
+| **Repo owner** (Kradauskas, the teammate who owns `Kradauskas/fixtee`) | Installs the app on their repos. Only the owner of a personal-account repo can install an app on it; collaborators can't |
 
 ---
 
@@ -127,28 +127,66 @@ Then store the `.pem` somewhere safe (password manager) and delete it from Downl
 
 ## 4. Install the app on a repo (repo owner: Kradauskas)
 
-Send Kradauskas the link `https://github.com/apps/<slug>/installations/new`. He then:
+Send Kradauskas the link `https://github.com/apps/<slug>/installations/new`. They then:
 
-1. Opens the link while logged into GitHub.
-2. Chooses his account **Kradauskas** as the install target.
-3. Selects **Only select repositories** and picks the repos whose CI we should watch: `fixtee` and/or
+1. Open the link while logged into GitHub.
+2. Choose their account **Kradauskas** as the install target.
+3. Select **Only select repositories** and picks the repos whose CI we should watch: `fixtee` and/or
    the demo repo. Not "All repositories".
-4. Reviews the permissions (Actions read, Contents read/write, Metadata read, Pull requests read/write)
+4. Review the permissions (Actions read, Contents read/write, Metadata read, Pull requests read/write)
    and clicks **Install**.
-5. GitHub then redirects his browser to the Setup URL
-   (`…/api/github/setup?installation_id=<id>&setup_action=install`). Until the install flow (Task 3) is
-   running on his machine or on Vercel this page won't load. That's fine; the installation already
-   exists.
-6. Sends the **installation ID** to the app owner: it's in that redirect URL, or at
+5. GitHub then redirects their browser to the Setup URL
+   (`…/api/github/setup?installation_id=<id>&setup_action=install`). If the app isn't running at that
+   address (e.g. `localhost` on someone else's machine) the page won't load. That's fine; the
+   installation already exists, see step 7.
+6. Send the **installation ID** to the app owner: it's in that redirect URL, or at
    **Settings → Applications → Installed GitHub Apps → Configure**, in the URL
    `https://github.com/settings/installations/<id>`.
+
+7. Whoever should own the projects in AutoFix signs in (section 5) and opens
+   `http://localhost:3000/api/github/setup?installation_id=<id>&setup_action=install`. That creates one
+   `projects` row per repo for the signed-in user. Opening it again re-syncs (adds new repos, removes
+   ones the installation lost).
+
+The first user to sync an installation owns it. Anyone else who opens the setup URL for it gets
+`/dashboard?install_error=claimed_by_other_user`. To hand an installation over, delete its `projects` rows
+first (SQL editor: `delete from projects where installation_id = <id>;`).
 
 Also make sure the repo has **Actions enabled** (repo → Settings → Actions → General).
 
 Later changes: if we add permissions to the app, Kradauskas gets an email and must **accept** the new
 permissions before they apply. Adding or removing repos is done on the same Configure page.
 
-## 5. Run locally
+## 5. Sign-in (Supabase Auth with GitHub)
+
+The app signs users in with GitHub through Supabase Auth. This is a **separate GitHub OAuth App**, not the
+GitHub App above. (A GitHub App could do it too, but an OAuth App is simpler and has no permissions.)
+
+1. GitHub → **Settings → Developer settings → OAuth Apps → New OAuth App**:
+   - Application name: `AutoFix login (dev)`
+   - Homepage URL: `http://localhost:3000`
+   - Authorization callback URL: `https://<project-ref>.supabase.co/auth/v1/callback`
+     (the host from `SUPABASE_URL`)
+   - Leave "Enable Device Flow" unchecked. Click **Register application**.
+2. On the next page, click **Generate a new client secret**. Copy the Client ID and the secret.
+3. Supabase dashboard → **Authentication → Sign In / Providers → GitHub**: enable it, paste the Client ID
+   and secret, and save. The secret lives in Supabase only, not in our env vars.
+4. Supabase dashboard → **Authentication → URL Configuration**:
+   - Site URL: `http://localhost:3000`
+   - Redirect URLs: add `http://localhost:3000/api/github/auth/callback` (later also
+     `https://<deploy url>/api/github/auth/callback`)
+
+Routes: `/api/github/login?next=/path` signs in and returns to `next`, `/api/github/logout` signs out.
+`/dashboard` is a placeholder (Role 3 replaces it) that lists your projects through RLS.
+
+If login fails with `Unsupported provider: provider is not enabled`, step 3 isn't done. If you land on
+the Site URL instead of the callback, the redirect URL in step 4 is missing.
+
+End-to-end test of the install flow: open `http://localhost:3000/api/github/install`, sign in with GitHub,
+install (or **Configure** → Save) on GitHub, and you land on `/dashboard?installed=<n>` with the repos
+listed.
+
+## 6. Run locally
 
 Three terminals:
 ```
@@ -170,11 +208,13 @@ Troubleshooting:
 - Signature checks fail **only** through smee: compare with a delivery to the deployed URL. smee
   re-serialises the JSON body, so in rare cases the bytes differ from what GitHub signed.
 
-## 6. Switching to the deployed app
+## 7. Switching to the deployed app
 
 When Vercel is up, change on the app's General page:
 - Webhook URL → `https://<deploy url>/api/github/webhook`
 - Setup URL → `https://<deploy url>/api/github/setup`
+- Supabase redirect URLs → add `https://<deploy url>/api/github/auth/callback`
+- Supabase Site URL → `https://<deploy url>`
 
 There is one webhook URL per app, so while it points at Vercel, smee (local) gets nothing. If both are
 needed at once, create a second "dev" app with its own env vars.
