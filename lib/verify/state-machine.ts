@@ -53,12 +53,18 @@ export type VerificationResult = {
 
 export type FixRunUrls = { redRunUrl?: string; greenRunUrl?: string };
 
-export type FixBranchRef = { projectId: string; branchName: string };
+export type RunHint = {
+  headSha?: string | null;
+  conclusion?: string | null;
+  runUrl?: string | null;
+};
+
+export type FixBranchRef = { projectId: string; branchName: string } & RunHint;
 
 export type VerifyDeps = {
   loadFix(fixId: string): Promise<FixVerificationContext | null>;
   findFixIdByBranch(projectId: string, branchName: string): Promise<string | null>;
-  saveStatus(fixId: string, status: FixStatus, runUrls: FixRunUrls): Promise<void>;
+  saveStatus(fixId: string, status: FixStatus, runUrls: FixRunUrls): Promise<boolean>;
   postPrComment(fix: FixVerificationContext, body: string): Promise<void>;
   markReadyForReview(fix: FixVerificationContext): Promise<void>;
   findCompletedRun(fix: FixVerificationContext, sha: string): Promise<CiRun>;
@@ -78,6 +84,21 @@ const SETTLED_STATUSES: ReadonlySet<FixStatus> = new Set<FixStatus>(["verified",
 export const NON_TERMINAL_STATUSES: FixStatus[] = Constants.public.Enums.fix_status.filter(
   (status) => !SETTLED_STATUSES.has(status),
 );
+
+export function normalizeConclusion(value: string | null | undefined): CiConclusion {
+  if (value === "success") return "success";
+  if (value === "failure") return "failure";
+  return null;
+}
+
+export function withRunHint(run: CiRun, sha: string | null, hint: RunHint): CiRun {
+  if (run.conclusion !== null) return run;
+  if (!sha || !hint.headSha || hint.headSha !== sha) return run;
+
+  const conclusion = normalizeConclusion(hint.conclusion);
+  if (conclusion === null) return run;
+  return { conclusion, runUrl: hint.runUrl ?? run.runUrl };
+}
 
 export function decideOutcome(
   testConclusion: CiConclusion,
@@ -135,7 +156,22 @@ export async function handleAgentCiResult(
 
   const recordsNewUrl = runUrls.redRunUrl !== undefined || runUrls.greenRunUrl !== undefined;
   if (target !== fix.status || recordsNewUrl) {
-    await deps.saveStatus(fixId, target, runUrls);
+    const saved = await deps.saveStatus(fixId, target, runUrls);
+    if (!saved) {
+      deps.log("verify: another run settled this fix first", {
+        fix: fixId,
+        outcome,
+        status: target,
+      });
+      return {
+        status: target,
+        outcome,
+        testRunUrl: effectiveTestRunUrl,
+        fixRunUrl,
+        commented: false,
+        markedReadyForReview: false,
+      };
+    }
   }
 
   const body = buildComment(outcome, fix, effectiveTestRunUrl, fixRunUrl);
@@ -171,12 +207,27 @@ export async function handleAgentCiResult(
 export async function syncFixVerification(
   fixId: string,
   deps: VerifyDeps = createVerifyDeps(),
+  hint: RunHint = {},
 ): Promise<VerificationResult> {
   const fix = await deps.loadFix(fixId);
   if (!fix) throw new Error(`verify: fix ${fixId} not found`);
 
-  const testRun = fix.testCommitSha ? await deps.findCompletedRun(fix, fix.testCommitSha) : NO_CI_RUN;
-  const fixRun = fix.fixCommitSha ? await deps.findCompletedRun(fix, fix.fixCommitSha) : NO_CI_RUN;
+  const reusesExistingTest = fix.testCommitSha === null && fix.fixCommitSha !== null;
+
+  let testRun: CiRun = NO_CI_RUN;
+  if (reusesExistingTest) {
+    testRun = { conclusion: "failure", runUrl: fix.redRunUrl };
+  } else if (fix.testCommitSha) {
+    testRun = withRunHint(
+      await deps.findCompletedRun(fix, fix.testCommitSha),
+      fix.testCommitSha,
+      hint,
+    );
+  }
+
+  const fixRun = fix.fixCommitSha
+    ? withRunHint(await deps.findCompletedRun(fix, fix.fixCommitSha), fix.fixCommitSha, hint)
+    : NO_CI_RUN;
 
   return handleAgentCiResult(
     {
@@ -191,7 +242,7 @@ export async function syncFixVerification(
 }
 
 export async function verifyFixByBranch(
-  { projectId, branchName }: FixBranchRef,
+  { projectId, branchName, ...hint }: FixBranchRef,
   deps: VerifyDeps = createVerifyDeps(),
 ): Promise<VerificationResult | null> {
   const fixId = await deps.findFixIdByBranch(projectId, branchName);
@@ -202,7 +253,7 @@ export async function verifyFixByBranch(
     });
     return null;
   }
-  return syncFixVerification(fixId, deps);
+  return syncFixVerification(fixId, deps, hint);
 }
 
 function shortSha(sha: string | null): string {
@@ -427,8 +478,14 @@ export function createVerifyDeps(options: VerifyDepsOptions = {}): VerifyDeps {
       if (runUrls.redRunUrl) patch.red_run_url = runUrls.redRunUrl;
       if (runUrls.greenRunUrl) patch.green_run_url = runUrls.greenRunUrl;
 
-      const { error } = await db.from("fixes").update(patch).eq("id", fixId);
+      const update = db.from("fixes").update(patch).eq("id", fixId);
+      const guarded = SETTLED_STATUSES.has(status)
+        ? update.in("status", NON_TERMINAL_STATUSES)
+        : update;
+
+      const { data, error } = await guarded.select("id");
       if (error) throw new Error(`verify: updating fix ${fixId} failed: ${error.message}`);
+      return data.length > 0;
     },
 
     async postPrComment(fix, body) {
