@@ -1,4 +1,3 @@
-import path from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { AgentError, runAgent as runAgentLoop } from "@/lib/agent/agent";
 import {
@@ -6,16 +5,15 @@ import {
   confidenceToNumber,
   createFix,
   findQueuedFix,
+  getProjectLlmKey,
   loadError,
   updateFix,
   type ErrorWithProject,
   type FixPatch,
 } from "@/lib/agent/db";
-import { getGithubConfig, GithubFixError, openFixPr } from "@/lib/agent/github";
+import { GithubFixError, openFixPr } from "@/lib/agent/github";
+import { checkoutRepo, RepoCheckoutError, type RepoCheckout } from "@/lib/agent/repo";
 import type { AgentOutput, ErrorInput } from "@/lib/agent/types";
-
-// TODO: check out the project's real repo instead of the demo repo.
-const DEMO_REPO_ROOT = path.join(process.cwd(), "fixtures", "agent", "demo-repo");
 
 export type RunAgentOptions = {
   /** When true (default), nothing is written to GitHub or the DB; planned writes are only logged. */
@@ -24,7 +22,7 @@ export type RunAgentOptions = {
 
 function describeError(err: unknown): string {
   if (err instanceof AgentError) return `[${err.code}] ${err.message}`;
-  if (err instanceof GithubFixError) return err.message;
+  if (err instanceof GithubFixError || err instanceof RepoCheckoutError) return err.message;
   return err instanceof Error ? err.message : String(err);
 }
 
@@ -43,6 +41,24 @@ function toErrorInput(row: ErrorWithProject): ErrorInput {
   };
 }
 
+/**
+ * The Anthropic API key for a project: its own key (get_project_llm_key) if set, else ANTHROPIC_API_KEY.
+ * The agent only speaks Anthropic, so projects configured for another provider fail here.
+ */
+async function resolveLlmKey(project: ErrorWithProject["projects"]): Promise<string> {
+  if (project.llm_provider && project.llm_provider !== "anthropic") {
+    throw new Error(
+      `project ${project.id} uses LLM provider "${project.llm_provider}", but the agent only supports "anthropic". ` +
+        "Switch the project to anthropic or remove its provider setting.",
+    );
+  }
+  const projectKey = await getProjectLlmKey(project.id);
+  if (projectKey) return projectKey;
+  const envKey = process.env.ANTHROPIC_API_KEY?.trim();
+  if (!envKey) throw new Error(`project ${project.id} has no LLM key and ANTHROPIC_API_KEY is not set.`);
+  return envKey;
+}
+
 function buildReasoning(output: AgentOutput): string {
   return `${output.explanation}\n\nRoot cause:\n${output.root_cause}`;
 }
@@ -51,8 +67,11 @@ function buildReasoning(output: AgentOutput): string {
  * Run the fixing agent for one stored error and record progress in `fixes`:
  * queued -> analyzing -> test_pushed -> fix_pushed, or failed on any error.
  *
- * With dryRun (default true) the error row is still read, and the agent still runs,
- * but no fixes row is created/updated and nothing is pushed to GitHub.
+ * The agent reads the project's real repo (projects.repo_owner/repo_name) at errors.commit_sha,
+ * downloaded via the project's GitHub App installation into a temp dir that is deleted afterwards.
+ *
+ * With dryRun (default true) the error row is still read, the repo is still downloaded (read only)
+ * and the agent still runs, but no fixes row is created/updated and nothing is pushed to GitHub.
  *
  * Never throws: every failure is logged (and, when not a dry run, stored as status 'failed').
  */
@@ -60,6 +79,7 @@ export async function runAgent(errorId: string, { dryRun = true }: RunAgentOptio
   const tag = `[agent] ${errorId}${dryRun ? " (dry run)" : ""}`;
   let fixId: string | null = null;
   let reasoningSaved = false;
+  let checkout: RepoCheckout | undefined;
 
   /** Write a patch to the fix row, or just log it in dry-run mode. */
   const writeFix = async (patch: FixPatch): Promise<void> => {
@@ -93,30 +113,19 @@ export async function runAgent(errorId: string, { dryRun = true }: RunAgentOptio
 
     await writeFix({ status: "analyzing" });
 
-    const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
-    if (!apiKey) throw new Error("ANTHROPIC_API_KEY is not set.");
+    const apiKey = await resolveLlmKey(project);
 
-    // With a GitHub App installation, the PR goes to the project's own repo (owner/name from projects).
-    // Without one we fall back to GITHUB_TOKEN + GITHUB_REPO and refuse to push to a different repo.
-    const installation = project.installation_id
-      ? { installationId: project.installation_id, owner: project.repo_owner, repo: project.repo_name }
-      : undefined;
-    if (!dryRun && !installation) {
-      const gh = getGithubConfig();
-      const same =
-        gh.owner.toLowerCase() === project.repo_owner.toLowerCase() &&
-        gh.repo.toLowerCase() === project.repo_name.toLowerCase();
-      if (!same) {
-        throw new Error(
-          `GITHUB_REPO is ${gh.owner}/${gh.repo}, but error ${errorId} belongs to ${project.repo_owner}/${project.repo_name}.`,
-        );
-      }
-    }
+    // Every project has a GitHub App installation; it is used both to read the repo and to open the PR.
+    const installation = { installationId: project.installation_id, owner: project.repo_owner, repo: project.repo_name };
+    const repoLabel = `${project.repo_owner}/${project.repo_name}@${input.commit_sha.slice(0, 7)}`;
 
-    console.log(`${tag}: running agent for ${project.repo_owner}/${project.repo_name} (demo repo checkout)`);
+    console.log(`${tag}: downloading ${repoLabel}`);
+    checkout = await checkoutRepo({ ...installation, ref: input.commit_sha });
+
+    console.log(`${tag}: running agent for ${repoLabel}`);
     const result = await runAgentLoop({
       client: new Anthropic({ apiKey }),
-      repoRoot: DEMO_REPO_ROOT,
+      repoRoot: checkout.root,
       input,
       onStep: ({ step, tools }) => console.log(`${tag}: step ${step}: ${tools.join(", ") || "(no tool call)"}`),
     });
@@ -140,8 +149,7 @@ export async function runAgent(errorId: string, { dryRun = true }: RunAgentOptio
 
     if (dryRun) {
       console.log(
-        `${tag}: would open PR on ${project.repo_owner}/${project.repo_name} via ` +
-          (installation ? `GitHub App installation ${installation.installationId}` : "GITHUB_TOKEN (PAT fallback)"),
+        `${tag}: would open PR on ${project.repo_owner}/${project.repo_name} via GitHub App installation ${installation.installationId}`,
       );
       console.log(`${tag}: would push test commit (${output.test.file_path}) -> status test_pushed`);
       console.log(`${tag}: would push fix commit and open draft PR -> status fix_pushed`);
@@ -173,5 +181,7 @@ export async function runAgent(errorId: string, { dryRun = true }: RunAgentOptio
     } catch (updateErr) {
       console.error(`${tag}: could not mark fix ${fixId} as failed: ${describeError(updateErr)}`);
     }
+  } finally {
+    await checkout?.cleanup();
   }
 }

@@ -1,34 +1,15 @@
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import type { Database, Json, Tables, TablesUpdate } from "@/lib/db/types";
+import type { Json, Tables, TablesUpdate } from "@/lib/db/types";
+import { getServiceClient } from "@/lib/db/supabase";
 import type { AgentOutput } from "@/lib/agent/types";
 
-type Db = SupabaseClient<Database>;
-
-let client: Db | null = null;
-
-/** Service-role client (bypasses RLS). Server-side only. Created lazily so imports never throw. */
-function db(): Db {
-  if (client) return client;
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  const missing = [
-    !url && "NEXT_PUBLIC_SUPABASE_URL",
-    !key && "SUPABASE_SERVICE_ROLE_KEY",
-  ].filter(Boolean);
-  if (missing.length > 0) {
-    throw new Error(`Supabase service-role client: missing env var(s): ${missing.join(", ")}`);
-  }
-  client = createClient<Database>(url!, key!, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-  return client;
-}
+/** Service-role client (bypasses RLS). Server-side only. */
+const db = getServiceClient;
 
 export type ErrorRow = Tables<"errors">;
 export type FixRow = Tables<"fixes">;
 export type ErrorProject = Pick<
   Tables<"projects">,
-  "repo_owner" | "repo_name" | "installation_id" | "default_branch"
+  "id" | "repo_owner" | "repo_name" | "installation_id" | "default_branch" | "llm_provider"
 >;
 export type ErrorWithProject = ErrorRow & { projects: ErrorProject };
 
@@ -52,7 +33,7 @@ export type PlannedChange = { path: string; search: string; replace: string };
 export async function loadError(errorId: string): Promise<ErrorWithProject> {
   const { data, error } = await db()
     .from("errors")
-    .select("*, projects(repo_owner, repo_name, installation_id, default_branch)")
+    .select("*, projects(id, repo_owner, repo_name, installation_id, default_branch, llm_provider)")
     .eq("id", errorId)
     .maybeSingle();
   if (error) throw new Error(`loadError(${errorId}): ${error.message}`);
@@ -109,12 +90,13 @@ export function confidenceToNumber(confidence: AgentOutput["confidence"]): numbe
   return CONFIDENCE[confidence];
 }
 
-/** Decrypts the project's LLM API key via the get_project_llm_key RPC. */
-export async function getProjectLlmKey(projectId: string): Promise<string> {
+/** Decrypts the project's LLM API key via the get_project_llm_key RPC. Null when the project has no key. */
+export async function getProjectLlmKey(projectId: string): Promise<string | null> {
   const { data, error } = await db().rpc("get_project_llm_key", { p_project_id: projectId });
   if (error) throw new Error(`getProjectLlmKey(${projectId}): ${error.message}`);
-  if (!data) throw new Error(`getProjectLlmKey(${projectId}): no key configured`);
-  return data;
+  // The generated type says string, but the function returns null when no key is set.
+  const key = (data as string | null)?.trim();
+  return key ? key : null;
 }
 
 export function changesToPlanned(changes: AgentOutput["changes"]): PlannedChange[] {
