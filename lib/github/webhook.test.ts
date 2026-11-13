@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import type { WorkflowRunContext } from "../ingest/failed-run";
 import { type WebhookDeps, type WebhookRequest, handleWebhook } from "./webhook";
 
@@ -224,4 +225,82 @@ describe("handleWebhook: installation events", () => {
     });
     expect(queued).toHaveLength(0);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Real payloads captured from GitHub (fixtures/webhooks, saved by scripts/fetch-deliveries.mjs)
+// ---------------------------------------------------------------------------
+
+function fixture(name: string): { event: string; payload: Record<string, unknown> } {
+  return JSON.parse(readFileSync(`fixtures/webhooks/${name}.json`, "utf8"));
+}
+
+function fixtureReq(
+  name: string,
+  edit?: (payload: { workflow_run: { head_branch: string } }) => void,
+): WebhookRequest {
+  const { event, payload } = fixture(name);
+  edit?.(payload as { workflow_run: { head_branch: string } });
+  return req(event, payload);
+}
+
+describe("handleWebhook: real GitHub payloads", () => {
+  const known = { projects: { "181656500:symantas/fixtee-test": PROJECT_ID } };
+
+  it("accepts the real failed workflow_run and passes the run details on", async () => {
+    const { deps, calls, flush } = fakeDeps(known);
+    expect((await handleWebhook(deps, fixtureReq("workflow-run-completed-failure"))).status).toBe(202);
+    await flush();
+    expect(calls.failed).toEqual([
+      expect.objectContaining({
+        projectId: PROJECT_ID,
+        installationId: 181656500,
+        owner: "Symantas",
+        repo: "fixtee-test",
+        runId: 43474741834,
+        runAttempt: 1,
+        headSha: "2c5ba0b97ecf1bb0d71c258c49299645e51d4d2a",
+        headBranch: "main",
+        conclusion: "failure",
+        runUrl: "https://github.com/Symantas/fixtee-test/actions/runs/43474741834",
+      }),
+    ]);
+  });
+
+  it("ignores the real workflow_run requested event", async () => {
+    const { deps, queued } = fakeDeps(known);
+    expect((await handleWebhook(deps, fixtureReq("workflow-run-requested"))).status).toBe(200);
+    expect(queued).toHaveLength(0);
+  });
+
+  it("routes the real payload to the autofix handler when it ran on an autofix/* branch", async () => {
+    const { deps, calls, flush } = fakeDeps(known);
+    const res = await handleWebhook(
+      deps,
+      fixtureReq("workflow-run-completed-failure", (p) => {
+        p.workflow_run.head_branch = "autofix/123";
+      }),
+    );
+    expect(res.status).toBe(202);
+    await flush();
+    expect(calls.autofix).toHaveLength(1);
+  });
+
+  it("answers 200 for the real payload when the repo isn't a project", async () => {
+    const { deps, queued } = fakeDeps({ projects: {} });
+    expect(await handleWebhook(deps, fixtureReq("workflow-run-completed-failure"))).toEqual({
+      status: 200,
+      message: "unknown project",
+    });
+    expect(queued).toHaveLength(0);
+  });
+
+  it.each(["installation-repositories-added", "installation-repositories-removed"])(
+    "re-syncs the installation for the real %s event",
+    async (name) => {
+      const { deps, calls } = fakeDeps(known);
+      expect((await handleWebhook(deps, fixtureReq(name))).status).toBe(200);
+      expect(calls.synced).toEqual([181656500]);
+    },
+  );
 });
