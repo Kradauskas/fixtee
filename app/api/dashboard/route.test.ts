@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
 import type { Db } from "../../../lib/db/supabase";
-import { parsePlannedChanges } from "../../../components/dashboard/diff-view";
-import { matchesSearch } from "../../../components/dashboard/error-feed";
-import { computeKpis } from "../../../components/dashboard/kpi-cards";
-import { stepIndex } from "../../../components/dashboard/pipeline-stepper";
-import type { DashboardError, DashboardFix } from "../../../components/dashboard/types";
+import {
+  guardrailReason,
+  matchesFilter,
+  matchesSearch,
+  metrics,
+  parsePlannedChanges,
+  proofSteps,
+  redProven,
+  type DashboardError,
+  type DashboardFix,
+  type Item,
+} from "../../../components/dashboard/types";
 import { handleDashboardRequest } from "./route";
 import { handleSetProjectKey } from "../projects/[id]/keys/route";
 
@@ -308,52 +315,77 @@ const asError = (overrides: Partial<DashboardError>): DashboardError =>
   }) as DashboardError;
 
 const asFix = (overrides: Partial<DashboardFix>): DashboardFix =>
-  ({ id: FIX_ID, error_id: ERROR_ID, status: "queued", tokens_used: null, ...overrides }) as DashboardFix;
+  ({
+    id: FIX_ID,
+    error_id: ERROR_ID,
+    status: "queued",
+    branch_name: null,
+    pr_number: null,
+    pr_url: null,
+    test_commit_sha: null,
+    fix_commit_sha: null,
+    red_run_url: null,
+    green_run_url: null,
+    ai_reasoning: null,
+    confidence: null,
+    tokens_used: null,
+    planned_changes: null,
+    created_at: "2026-11-13T00:00:00Z",
+    updated_at: "2026-11-13T00:00:00Z",
+    ...overrides,
+  }) as DashboardFix;
 
-describe("computeKpis", () => {
-  it("counts failures, outcomes and tokens", () => {
-    const kpis = computeKpis(
-      [asError({ id: "e1" }), asError({ id: "e2" })],
-      [
-        asFix({ status: "verified", tokens_used: 1200 }),
-        asFix({ status: "failed", tokens_used: 800 }),
-        asFix({ status: "fix_pushed", tokens_used: null }),
-      ],
-    );
+const asItem = (fix: Partial<DashboardFix>, error: Partial<DashboardError> = {}): Item => ({
+  error: asError(error),
+  fix: asFix(fix),
+});
 
-    expect(kpis).toEqual({ failuresCaught: 2, verified: 1, failed: 1, tokensUsed: 2000 });
+describe("metrics", () => {
+  it("counts failures, verified fixes, guardrails and tokens", () => {
+    const result = metrics([
+      asItem({ status: "verified", tokens_used: 1200 }, { id: "e1" }),
+      asItem({ status: "failed", tokens_used: 800 }, { id: "e2" }),
+      asItem({ status: "fix_pushed", tokens_used: null }, { id: "e3" }),
+    ]);
+
+    expect(result).toEqual({ errors: 3, verified: 1, blocked: 1, tokens: 2000 });
   });
 
   it("is all zeroes with nothing to show", () => {
-    expect(computeKpis([], [])).toEqual({
-      failuresCaught: 0,
-      verified: 0,
-      failed: 0,
-      tokensUsed: 0,
-    });
+    expect(metrics([])).toEqual({ errors: 0, verified: 0, blocked: 0, tokens: 0 });
   });
 });
 
-describe("matchesSearch", () => {
-  const error = asError({
-    error_message: "TypeError: cannot read price",
-    file_path: "src/price.js",
-    commit_sha: "abc1234def",
+describe("matchesSearch and matchesFilter", () => {
+  const item = asItem(
+    { branch_name: "autofix/err-1", status: "verified" },
+    {
+      error_message: "TypeError: cannot read price",
+      file_path: "src/price.js",
+      commit_sha: "abc1234def",
+    },
+  );
+
+  it("matches on message, file, sha and branch, ignoring case", () => {
+    expect(matchesSearch(item, "typeerror")).toBe(true);
+    expect(matchesSearch(item, "price.js")).toBe(true);
+    expect(matchesSearch(item, "ABC1234")).toBe(true);
+    expect(matchesSearch(item, "autofix/")).toBe(true);
+    expect(matchesSearch(item, "   ")).toBe(true);
+    expect(matchesSearch(item, "nothing here")).toBe(false);
   });
 
-  it("matches on message, file and sha, ignoring case", () => {
-    expect(matchesSearch(error, "typeerror")).toBe(true);
-    expect(matchesSearch(error, "price.js")).toBe(true);
-    expect(matchesSearch(error, "ABC1234")).toBe(true);
-  });
+  it("splits the feed into verified, running and blocked", () => {
+    const verified = asItem({ status: "verified" });
+    const running = asItem({ status: "fix_pushed" });
+    const blocked = asItem({ status: "failed" });
 
-  it("keeps everything when the query is blank", () => {
-    expect(matchesSearch(error, "   ")).toBe(true);
-  });
-
-  it("drops rows that match nothing, and tolerates null fields", () => {
-    expect(matchesSearch(error, "nothing here")).toBe(false);
-    expect(matchesSearch(asError({ error_message: null }), "anything")).toBe(false);
+    expect(matchesFilter(verified, "verified")).toBe(true);
+    expect(matchesFilter(verified, "running")).toBe(false);
+    expect(matchesFilter(running, "running")).toBe(true);
+    expect(matchesFilter(blocked, "failed")).toBe(true);
+    expect(matchesFilter(blocked, "running")).toBe(false);
+    expect([verified, running, blocked].every((item) => matchesFilter(item, "all"))).toBe(true);
   });
 });
 
@@ -377,15 +409,59 @@ describe("parsePlannedChanges", () => {
   });
 });
 
-describe("stepIndex", () => {
-  it("places each status on the pipeline", () => {
-    expect(stepIndex("queued")).toBe(0);
-    expect(stepIndex("test_failed")).toBe(3);
-    expect(stepIndex("verified")).toBe(5);
+describe("proofSteps", () => {
+  it("walks the three steps as the fix progresses", () => {
+    const queued = proofSteps(asItem({ status: "queued" }));
+    expect(queued[0].running).toBe(true);
+    expect(queued.every((step) => !step.complete)).toBe(true);
+
+    const testPushed = proofSteps(
+      asItem({ status: "test_pushed", ai_reasoning: "because", test_commit_sha: "aaaaaaa1" }),
+    );
+    expect(testPushed[0].complete).toBe(true);
+    expect(testPushed[1].running).toBe(true);
+
+    const verified = proofSteps(
+      asItem({
+        status: "verified",
+        ai_reasoning: "because",
+        test_commit_sha: "aaaaaaa1",
+        fix_commit_sha: "bbbbbbb2",
+      }),
+    );
+    expect(verified.every((step) => step.complete)).toBe(true);
   });
 
-  it("has no position for a failed or missing fix", () => {
-    expect(stepIndex("failed")).toBe(-1);
-    expect(stepIndex(null)).toBe(-1);
+  it("completes the red step from red_run_url when there is no test commit", () => {
+    const item = asItem({
+      status: "fix_pushed",
+      ai_reasoning: "because",
+      test_commit_sha: null,
+      red_run_url: "https://example.test/red",
+      fix_commit_sha: "bbbbbbb2",
+    });
+
+    const steps = proofSteps(item);
+
+    expect(redProven(item.fix)).toBe(true);
+    expect(steps[1].complete).toBe(true);
+    expect(steps[1].tone).toBe("reproduced");
+    expect(steps[1].sha).toBeNull();
+    expect(steps[1].shaLabel).toBe("existing test");
+    expect(steps[1].runUrl).toBe("https://example.test/red");
+    expect(steps[2].complete).toBe(false);
+    expect(steps[2].running).toBe(true);
+  });
+
+  it("marks a guardrail-blocked fix without completing the red step", () => {
+    const item = asItem({ status: "failed", ai_reasoning: "because", confidence: 0.2 });
+
+    const steps = proofSteps(item);
+
+    expect(guardrailReason(item)).toContain("Guardrail triggered");
+    expect(steps[1].tone).toBe("blocked");
+    expect(steps[1].complete).toBe(false);
+    expect(steps[2].tone).toBe("blocked");
+    expect(steps.every((step) => !step.running)).toBe(true);
   });
 });

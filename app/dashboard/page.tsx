@@ -36,8 +36,18 @@ export default function DashboardPage({ searchParams }: { searchParams: SearchPa
 
 function DashboardSkeleton() {
   return (
-    <main className="flex min-h-full items-center justify-center bg-zinc-950 p-8">
-      <p className="font-mono text-sm text-zinc-500">Loading dashboard…</p>
+    <main
+      style={{
+        minHeight: "100vh",
+        display: "grid",
+        placeItems: "center",
+        background: "oklch(0.145 0.012 275)",
+        color: "oklch(0.62 0.016 275)",
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        fontSize: 13,
+      }}
+    >
+      Loading dashboard…
     </main>
   );
 }
