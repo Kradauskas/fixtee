@@ -8,12 +8,12 @@ import {
   ArrowUpRight,
   BrandMark,
   Check,
-  ChevronDown,
   CircleDot,
   GitBranch,
   GitPullRequest,
   Github,
   Loader,
+  LogOut,
   Search,
   Settings,
   ShieldCheck,
@@ -134,7 +134,7 @@ export function DashboardClient({
       if (seq !== loadSeq.current) return;
 
       if (response.status === 401) {
-        setLoadError("Your session expired. Reload the page to sign in again.");
+        setLoadError("Your session expired. Sign in again to continue.");
         setSessionExpired(true);
         setOffline(false);
         return;
@@ -232,7 +232,7 @@ export function DashboardClient({
           previous,
           onTransitioned: () => load({ force: true }),
           onSessionExpired: () => {
-            setLoadError("Your session expired. Reload the page to sign in again.");
+            setLoadError("Your session expired. Sign in again to continue.");
             setSessionExpired(true);
           },
         });
@@ -394,14 +394,22 @@ export function DashboardClient({
               </select>
             </span>
           ) : (
-            <span className="ghost-button repo-selector">
+            <span
+              className="repo-selector"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 7,
+                padding: "6px 9px",
+                color: "var(--foreground)",
+              }}
+            >
               <Github size={15} />
               <span className="repo-owner">{project ? `${project.repo_owner} /` : "no repo /"}</span>
               {project?.repo_name ?? "connect a repository"}
               <span>
                 <GitBranch size={11} /> {project?.default_branch ?? "main"}
               </span>
-              <ChevronDown size={12} />
             </span>
           )}
           <span className="topbar-divider" />
@@ -413,15 +421,44 @@ export function DashboardClient({
           >
             <Settings size={16} />
           </button>
-          {signedIn && userLabel ? (
-            <a className="avatar" href="/api/github/logout" title={userLabel}>
-              {userLabel.slice(0, 2).toUpperCase()}
-            </a>
+          {signedIn && !sessionExpired ? (
+            <>
+              {userLabel && (
+                <span
+                  className="avatar"
+                  title={`Signed in as ${userLabel}`}
+                  aria-label={`Signed in as ${userLabel}`}
+                >
+                  {userLabel.slice(0, 2).toUpperCase()}
+                </span>
+              )}
+              <a
+                className="pr-button-outline"
+                href="/api/github/logout"
+                style={{ whiteSpace: "nowrap" }}
+              >
+                <LogOut size={14} />
+                Sign out
+              </a>
+            </>
           ) : (
-            <a className="pr-button" href="/api/github/install">
-              <Github size={14} />
-              Connect GitHub
-            </a>
+            <>
+              <a
+                className="pr-button-outline"
+                href="/api/github/login?next=/dashboard"
+                style={{ whiteSpace: "nowrap" }}
+              >
+                Sign in
+              </a>
+              <a
+                className="pr-button"
+                href="/api/github/install"
+                style={{ whiteSpace: "nowrap" }}
+              >
+                <Github size={14} />
+                Connect GitHub
+              </a>
+            </>
           )}
         </div>
       </nav>
@@ -522,9 +559,9 @@ export function DashboardClient({
 
           {usingDemo && (
             <p className="settings-info">
-              {signedIn
+              {signedIn && !sessionExpired
                 ? "No CI failures recorded yet — showing a sample so you can explore the proof view."
-                : "Demo data. Connect GitHub to catch and verify failures from your own repositories."}
+                : "Demo data. Sign in or connect GitHub to catch and verify failures from your own repositories."}
             </p>
           )}
 
@@ -567,7 +604,8 @@ export function DashboardClient({
       {settingsOpen && (
         <SettingsDialog
           project={project}
-          signedIn={signedIn}
+          signedIn={signedIn && !sessionExpired}
+          userLabel={userLabel}
           onClose={() => setSettingsOpen(false)}
           onSaved={(message, tone) => {
             pushToast(message, tone);

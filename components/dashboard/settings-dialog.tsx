@@ -1,17 +1,19 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Github, KeyRound, Loader, ShieldCheck } from "./icons";
+import { ArrowUpRight, Github, KeyRound, Loader, LogOut, ShieldCheck } from "./icons";
 import type { DashboardProject } from "./types";
 
 export function SettingsDialog({
   project,
   signedIn,
+  userLabel,
   onClose,
   onSaved,
 }: {
   project: DashboardProject | null;
   signedIn: boolean;
+  userLabel?: string | null;
   onClose: () => void;
   onSaved: (message: string, tone: "success" | "warning") => void;
 }) {
@@ -86,16 +88,48 @@ export function SettingsDialog({
             {project
               ? `Installation ${project.installation_id} · ${project.default_branch} branch`
               : signedIn
-                ? "Install the Fixtee GitHub App to start catching CI failures."
-                : "Sign in and install the Fixtee GitHub App to catch failures from your own repositories."}
+                ? "Install the Fixtee GitHub App or add repositories to start catching CI failures."
+                : "Already installed Fixtee? Sign in to load your repositories, or connect GitHub to install the App."}
           </div>
-          {!project && (
-            <a className="pr-button" href="/api/github/install">
-              <Github size={14} />
-              {signedIn ? "Install the GitHub App" : "Connect GitHub / Sign in"}
-            </a>
-          )}
+          <div className="settings-row" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
+            {signedIn || project ? (
+              <a className={project ? "pr-button-outline" : "pr-button"} href="/api/github/install">
+                <Github size={14} />
+                Manage / Add GitHub repositories
+                <ArrowUpRight size={13} />
+              </a>
+            ) : (
+              <>
+                <a className="pr-button-outline" href="/api/github/login?next=/dashboard">
+                  Sign in
+                </a>
+                <a className="pr-button" href="/api/github/install">
+                  <Github size={14} />
+                  Connect GitHub
+                </a>
+              </>
+            )}
+          </div>
         </section>
+
+        {signedIn && (
+          <section className="settings-section">
+            <div className="settings-row">
+              <div style={{ minWidth: 0 }}>
+                <h3>GitHub account</h3>
+                {userLabel && <div className="settings-info">Signed in as {userLabel}</div>}
+              </div>
+              <a
+                className="pr-button-outline"
+                href="/api/github/logout"
+                style={{ flexShrink: 0, whiteSpace: "nowrap" }}
+              >
+                <LogOut size={14} />
+                Sign out
+              </a>
+            </div>
+          </section>
+        )}
 
         <section className="settings-section">
           <h3>
