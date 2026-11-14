@@ -20,6 +20,8 @@ export type FixVerificationContext = {
   prUrl: string | null;
   testCommitSha: string | null;
   fixCommitSha: string | null;
+  redRunUrl: string | null;
+  greenRunUrl: string | null;
   owner: string;
   repo: string;
   installationId: number;
@@ -51,12 +53,18 @@ export type VerificationResult = {
 
 export type FixRunUrls = { redRunUrl?: string; greenRunUrl?: string };
 
-export type FixBranchRef = { projectId: string; branchName: string };
+export type RunHint = {
+  headSha?: string | null;
+  conclusion?: string | null;
+  runUrl?: string | null;
+};
+
+export type FixBranchRef = { projectId: string; branchName: string } & RunHint;
 
 export type VerifyDeps = {
   loadFix(fixId: string): Promise<FixVerificationContext | null>;
   findFixIdByBranch(projectId: string, branchName: string): Promise<string | null>;
-  saveStatus(fixId: string, status: FixStatus, runUrls: FixRunUrls): Promise<void>;
+  saveStatus(fixId: string, status: FixStatus, runUrls: FixRunUrls): Promise<boolean>;
   postPrComment(fix: FixVerificationContext, body: string): Promise<void>;
   markReadyForReview(fix: FixVerificationContext): Promise<void>;
   findCompletedRun(fix: FixVerificationContext, sha: string): Promise<CiRun>;
@@ -77,6 +85,21 @@ export const NON_TERMINAL_STATUSES: FixStatus[] = Constants.public.Enums.fix_sta
   (status) => !SETTLED_STATUSES.has(status),
 );
 
+export function normalizeConclusion(value: string | null | undefined): CiConclusion {
+  if (value === "success") return "success";
+  if (value === "failure") return "failure";
+  return null;
+}
+
+export function withRunHint(run: CiRun, sha: string | null, hint: RunHint): CiRun {
+  if (run.conclusion !== null) return run;
+  if (!sha || !hint.headSha || hint.headSha !== sha) return run;
+
+  const conclusion = normalizeConclusion(hint.conclusion);
+  if (conclusion === null) return run;
+  return { conclusion, runUrl: hint.runUrl ?? run.runUrl };
+}
+
 export function decideOutcome(
   testConclusion: CiConclusion,
   fixConclusion: CiConclusion,
@@ -95,11 +118,15 @@ export async function handleAgentCiResult(
   const fix = await deps.loadFix(fixId);
   if (!fix) throw new Error(`verify: fix ${fixId} not found`);
 
-  const outcome = decideOutcome(testConclusion, fixConclusion);
+  const reusesExistingTest = fix.testCommitSha === null && fix.fixCommitSha !== null;
+  const effectiveTestConclusion: CiConclusion = reusesExistingTest ? "failure" : testConclusion;
+  const effectiveTestRunUrl = reusesExistingTest ? (testRunUrl ?? fix.redRunUrl) : testRunUrl;
+
+  const outcome = decideOutcome(effectiveTestConclusion, fixConclusion);
   const noChange = (status: FixStatus): VerificationResult => ({
     status,
     outcome,
-    testRunUrl,
+    testRunUrl: effectiveTestRunUrl,
     fixRunUrl,
     commented: false,
     markedReadyForReview: false,
@@ -109,7 +136,7 @@ export async function handleAgentCiResult(
   if (target === null) {
     deps.log("verify: CI result is not conclusive yet", {
       fix: fixId,
-      test: testConclusion,
+      test: effectiveTestConclusion,
       fixCommit: fixConclusion,
     });
     return noChange(fix.status);
@@ -120,11 +147,34 @@ export async function handleAgentCiResult(
   }
 
   const runUrls: FixRunUrls = {};
-  if (testRunUrl) runUrls.redRunUrl = testRunUrl;
-  if (outcome === "verified" && fixRunUrl) runUrls.greenRunUrl = fixRunUrl;
-  await deps.saveStatus(fixId, target, runUrls);
+  if (effectiveTestRunUrl && effectiveTestRunUrl !== fix.redRunUrl) {
+    runUrls.redRunUrl = effectiveTestRunUrl;
+  }
+  if (outcome === "verified" && fixRunUrl && fixRunUrl !== fix.greenRunUrl) {
+    runUrls.greenRunUrl = fixRunUrl;
+  }
 
-  const body = buildComment(outcome, fix, testRunUrl, fixRunUrl);
+  const recordsNewUrl = runUrls.redRunUrl !== undefined || runUrls.greenRunUrl !== undefined;
+  if (target !== fix.status || recordsNewUrl) {
+    const saved = await deps.saveStatus(fixId, target, runUrls);
+    if (!saved) {
+      deps.log("verify: another run settled this fix first", {
+        fix: fixId,
+        outcome,
+        status: target,
+      });
+      return {
+        status: target,
+        outcome,
+        testRunUrl: effectiveTestRunUrl,
+        fixRunUrl,
+        commented: false,
+        markedReadyForReview: false,
+      };
+    }
+  }
+
+  const body = buildComment(outcome, fix, effectiveTestRunUrl, fixRunUrl);
   const hasPr = fix.prNumber !== null;
   if (body && !hasPr) {
     deps.log("verify: no pull request recorded, skipping comment", { fix: fixId, outcome });
@@ -144,18 +194,40 @@ export async function handleAgentCiResult(
     readyForReview: markedReadyForReview,
   });
 
-  return { status: target, outcome, testRunUrl, fixRunUrl, commented, markedReadyForReview };
+  return {
+    status: target,
+    outcome,
+    testRunUrl: effectiveTestRunUrl,
+    fixRunUrl,
+    commented,
+    markedReadyForReview,
+  };
 }
 
 export async function syncFixVerification(
   fixId: string,
   deps: VerifyDeps = createVerifyDeps(),
+  hint: RunHint = {},
 ): Promise<VerificationResult> {
   const fix = await deps.loadFix(fixId);
   if (!fix) throw new Error(`verify: fix ${fixId} not found`);
 
-  const testRun = fix.testCommitSha ? await deps.findCompletedRun(fix, fix.testCommitSha) : NO_CI_RUN;
-  const fixRun = fix.fixCommitSha ? await deps.findCompletedRun(fix, fix.fixCommitSha) : NO_CI_RUN;
+  const reusesExistingTest = fix.testCommitSha === null && fix.fixCommitSha !== null;
+
+  let testRun: CiRun = NO_CI_RUN;
+  if (reusesExistingTest) {
+    testRun = { conclusion: "failure", runUrl: fix.redRunUrl };
+  } else if (fix.testCommitSha) {
+    testRun = withRunHint(
+      await deps.findCompletedRun(fix, fix.testCommitSha),
+      fix.testCommitSha,
+      hint,
+    );
+  }
+
+  const fixRun = fix.fixCommitSha
+    ? withRunHint(await deps.findCompletedRun(fix, fix.fixCommitSha), fix.fixCommitSha, hint)
+    : NO_CI_RUN;
 
   return handleAgentCiResult(
     {
@@ -170,7 +242,7 @@ export async function syncFixVerification(
 }
 
 export async function verifyFixByBranch(
-  { projectId, branchName }: FixBranchRef,
+  { projectId, branchName, ...hint }: FixBranchRef,
   deps: VerifyDeps = createVerifyDeps(),
 ): Promise<VerificationResult | null> {
   const fixId = await deps.findFixIdByBranch(projectId, branchName);
@@ -181,7 +253,7 @@ export async function verifyFixByBranch(
     });
     return null;
   }
-  return syncFixVerification(fixId, deps);
+  return syncFixVerification(fixId, deps, hint);
 }
 
 function shortSha(sha: string | null): string {
@@ -204,16 +276,29 @@ export function buildComment(
 ): string | null {
   const testSha = shortSha(fix.testCommitSha);
   const fixSha = shortSha(fix.fixCommitSha);
+  const reusesExistingTest = fix.testCommitSha === null;
+
+  const redCell = reusesExistingTest ? "existing test" : `\`${testSha}\``;
+  const redProof = reusesExistingTest
+    ? "🔴 the failing run this fix answers"
+    : "🔴 reproduction test, without the fix";
+  const greenProof = reusesExistingTest
+    ? "🟢 that test, with the fix"
+    : "🟢 the same test, with the fix";
+  const preamble = reusesExistingTest
+    ? "A test in the repository already reproduced this failure, so Fixtee did not add one."
+    : null;
 
   switch (outcome) {
     case "verified":
       return [
         "## 🟢 Fixtee verified this fix",
         "",
-        "| Commit | What it proves | CI |",
+        ...(preamble ? [preamble, ""] : []),
+        "| Evidence | What it proves | CI |",
         "| --- | --- | --- |",
-        `| \`${testSha}\` | 🔴 reproduction test, without the fix | ${runLink("failed as expected", testRunUrl)} |`,
-        `| \`${fixSha}\` | 🟢 the same test, with the fix | ${runLink("passed", fixRunUrl)} |`,
+        `| ${redCell} | ${redProof} | ${runLink("failed as expected", testRunUrl)} |`,
+        `| \`${fixSha}\` | ${greenProof} | ${runLink("passed", fixRunUrl)} |`,
         "",
         "The test fails before the change and passes after it, so this change is what turns CI green.",
         "",
@@ -237,7 +322,9 @@ export function buildComment(
       return [
         "## ❌ Fixtee could not verify this fix",
         "",
-        `🔴 The reproduction test on \`${testSha}\` ${runLink("failed as expected", testRunUrl)}, so the bug is reproduced.`,
+        reusesExistingTest
+          ? `🔴 An existing test ${runLink("already reproduced this failure", testRunUrl)}.`
+          : `🔴 The reproduction test on \`${testSha}\` ${runLink("failed as expected", testRunUrl)}, so the bug is reproduced.`,
         `❌ But CI still ${runLink("fails on the fix commit", fixRunUrl)} \`${fixSha}\`.`,
         "",
         "The change does not make the failing test pass. This pull request stays a draft for a human to look at.",
@@ -298,6 +385,8 @@ const fixRowSchema = z.object({
   pr_url: z.string().nullable(),
   test_commit_sha: z.string().nullable(),
   fix_commit_sha: z.string().nullable(),
+  red_run_url: z.string().nullable(),
+  green_run_url: z.string().nullable(),
   errors: embedded(errorSchema),
 });
 
@@ -334,6 +423,8 @@ export function toVerificationContext(row: unknown): FixVerificationContext {
     prUrl: fix.pr_url,
     testCommitSha: fix.test_commit_sha,
     fixCommitSha: fix.fix_commit_sha,
+    redRunUrl: fix.red_run_url,
+    greenRunUrl: fix.green_run_url,
     owner: project.repo_owner,
     repo: project.repo_name,
     installationId: project.installation_id,
@@ -357,7 +448,7 @@ export function createVerifyDeps(options: VerifyDepsOptions = {}): VerifyDeps {
       const { data, error } = await db
         .from("fixes")
         .select(
-          "id, status, confidence, branch_name, pr_number, pr_url, test_commit_sha, fix_commit_sha, errors(projects(repo_owner, repo_name, installation_id))",
+          "id, status, confidence, branch_name, pr_number, pr_url, test_commit_sha, fix_commit_sha, red_run_url, green_run_url, errors(projects(repo_owner, repo_name, installation_id))",
         )
         .eq("id", fixId)
         .maybeSingle();
@@ -387,8 +478,14 @@ export function createVerifyDeps(options: VerifyDepsOptions = {}): VerifyDeps {
       if (runUrls.redRunUrl) patch.red_run_url = runUrls.redRunUrl;
       if (runUrls.greenRunUrl) patch.green_run_url = runUrls.greenRunUrl;
 
-      const { error } = await db.from("fixes").update(patch).eq("id", fixId);
+      const update = db.from("fixes").update(patch).eq("id", fixId);
+      const guarded = SETTLED_STATUSES.has(status)
+        ? update.in("status", NON_TERMINAL_STATUSES)
+        : update;
+
+      const { data, error } = await guarded.select("id");
       if (error) throw new Error(`verify: updating fix ${fixId} failed: ${error.message}`);
+      return data.length > 0;
     },
 
     async postPrComment(fix, body) {
