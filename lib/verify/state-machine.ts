@@ -88,7 +88,7 @@ export type VerifyDeps = {
   revertStatus?(fixId: string, fromStatus: FixStatus, toStatus: FixStatus): Promise<void>;
   updatePrDescription?(fix: FixVerificationContext, info: PrDescriptionUpdate): Promise<void>;
   postPrComment(fix: FixVerificationContext, body: string): Promise<void>;
-  markReadyForReview(fix: FixVerificationContext): Promise<void>;
+  markReadyForReview(fix: FixVerificationContext): Promise<boolean | void>;
   findCompletedRun(fix: FixVerificationContext, sha: string): Promise<CiRun>;
   log(message: string, details?: Record<string, unknown>): void;
 };
@@ -324,7 +324,7 @@ export async function handleAgentCiResult(
   const shouldUpdatePrDescription =
     hasPr && (SETTLED_STATUSES.has(target) || runUrls.redRunUrl !== undefined);
   const commented = Boolean(body) && hasPr;
-  const markedReadyForReview = outcome === "verified" && hasPr;
+  let markedReadyForReview = false;
 
   // Claim status atomically first, perform idempotent GitHub writes, and roll back non-terminal
   // source status on failure so transient GitHub errors never lock out retries.
@@ -337,7 +337,9 @@ export async function handleAgentCiResult(
         fixRunUrl,
       });
     }
-    if (markedReadyForReview) await deps.markReadyForReview(fix);
+    if (outcome === "verified" && hasPr) {
+      markedReadyForReview = (await deps.markReadyForReview(fix)) !== false;
+    }
     if (body && hasPr) await deps.postPrComment(fix, body);
   } catch (err) {
     if (wroteStatus) {
@@ -522,9 +524,24 @@ export type VerifyDepsOptions = {
   getClient?: (installationId: number) => Promise<GithubClient>;
 };
 
+export type WorkflowRunEntry = {
+  id?: number;
+  workflow_id?: number;
+  run_attempt?: number;
+  created_at?: string;
+  updated_at?: string;
+  conclusion: string | null;
+  html_url: string;
+};
+
 const workflowRunsSchema = z.object({
   workflow_runs: z.array(
     z.object({
+      id: z.number().optional(),
+      workflow_id: z.number().optional(),
+      run_attempt: z.number().optional(),
+      created_at: z.string().optional(),
+      updated_at: z.string().optional(),
       conclusion: z.string().nullable(),
       html_url: z.string(),
     }),
@@ -533,6 +550,7 @@ const workflowRunsSchema = z.object({
 
 const pullRequestSchema = z.object({
   node_id: z.string(),
+  state: z.string().optional(),
   draft: z.boolean().optional(),
   body: z.string().nullable().optional(),
 });
@@ -586,14 +604,73 @@ const READY_FOR_REVIEW_MUTATION = `
   }
 `;
 
-export function pickRun(runs: { conclusion: string | null; html_url: string }[]): CiRun {
-  const failed = runs.find((run) => normalizeConclusion(run.conclusion) === "failure");
+function timestampMs(value: string | undefined): number | null {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isNewerRun(candidate: WorkflowRunEntry, current: WorkflowRunEntry): boolean {
+  if (candidate.id !== undefined && current.id !== undefined && candidate.id === current.id) {
+    const candAttempt = candidate.run_attempt ?? 0;
+    const currAttempt = current.run_attempt ?? 0;
+    if (candAttempt !== currAttempt) return candAttempt > currAttempt;
+  }
+
+  const candCreated = timestampMs(candidate.created_at);
+  const currCreated = timestampMs(current.created_at);
+  if (candCreated !== null && currCreated !== null && candCreated !== currCreated) {
+    return candCreated > currCreated;
+  }
+
+  if (candidate.id !== undefined && current.id !== undefined && candidate.id !== current.id) {
+    return candidate.id > current.id;
+  }
+
+  if (
+    candidate.run_attempt !== undefined &&
+    current.run_attempt !== undefined &&
+    candidate.run_attempt !== current.run_attempt
+  ) {
+    return candidate.run_attempt > current.run_attempt;
+  }
+
+  const candUpdated = timestampMs(candidate.updated_at);
+  const currUpdated = timestampMs(current.updated_at);
+  if (candUpdated !== null && currUpdated !== null && candUpdated !== currUpdated) {
+    return candUpdated > currUpdated;
+  }
+
+  return false;
+}
+
+export function latestRunsPerWorkflow(runs: WorkflowRunEntry[]): WorkflowRunEntry[] {
+  const latest = new Map<string, WorkflowRunEntry>();
+  for (let index = 0; index < runs.length; index += 1) {
+    const entry = runs[index];
+    const key =
+      entry.workflow_id !== undefined
+        ? `wf:${entry.workflow_id}`
+        : entry.id !== undefined
+          ? `run:${entry.id}`
+          : `idx:${index}`;
+    const existing = latest.get(key);
+    if (!existing || isNewerRun(entry, existing)) {
+      latest.set(key, entry);
+    }
+  }
+  return Array.from(latest.values());
+}
+
+export function pickRun(runs: WorkflowRunEntry[]): CiRun {
+  const latest = latestRunsPerWorkflow(runs);
+  const failed = latest.find((run) => normalizeConclusion(run.conclusion) === "failure");
   if (failed) return { conclusion: "failure", runUrl: failed.html_url };
 
-  const passed = runs.find((run) => normalizeConclusion(run.conclusion) === "success");
+  const passed = latest.find((run) => normalizeConclusion(run.conclusion) === "success");
   if (passed) return { conclusion: "success", runUrl: passed.html_url };
 
-  return { conclusion: null, runUrl: runs[0]?.html_url ?? null };
+  return { conclusion: null, runUrl: latest[0]?.html_url ?? null };
 }
 
 export function toVerificationContext(row: unknown): FixVerificationContext {
@@ -735,16 +812,18 @@ export function createVerifyDeps(options: VerifyDepsOptions = {}): VerifyDeps {
     },
 
     async markReadyForReview(fix) {
-      if (fix.prNumber === null) return;
+      if (fix.prNumber === null) return false;
       const client = await getClient(fix.installationId);
       const pull = await client.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
         owner: fix.owner,
         repo: fix.repo,
         pull_number: fix.prNumber,
       });
-      const { node_id, draft } = pullRequestSchema.parse(pull.data);
-      if (draft === false) return;
+      const { node_id, state, draft } = pullRequestSchema.parse(pull.data);
+      if (state !== "open") return false;
+      if (draft !== true) return draft === false;
       await client.graphql(READY_FOR_REVIEW_MUTATION, { pullRequestId: node_id });
+      return true;
     },
 
     async findCompletedRun(fix, sha) {

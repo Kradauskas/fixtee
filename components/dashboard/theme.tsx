@@ -200,6 +200,11 @@ const CSS = `
 .toast-warning { border-color: color-mix(in oklab, var(--warning) 35%, var(--border)); color: var(--warning); }
 
 .empty-note { color: var(--muted-foreground); font-size: 12px; text-align: center; padding: 40px 0; }
+.waiting-state { border: 1px dashed var(--border); border-radius: 8px; background: var(--card); padding: 36px 24px; text-align: center; display: grid; justify-items: center; gap: 10px; }
+.waiting-state h2 { font-size: 15px; font-weight: 600; color: var(--foreground); }
+.waiting-state p { color: var(--muted-foreground); font-size: 12px; max-width: 520px; line-height: 1.6; }
+.waiting-actions { display: flex; align-items: center; gap: 10px; margin-top: 6px; flex-wrap: wrap; justify-content: center; }
+.sample-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--muted-foreground); font-size: 11px; flex-wrap: wrap; }
 .spin { animation: border-spinner 1s linear infinite; }
 
 @media (max-width: 1100px) { .fx .brand-tag { display: none; } .fx .topbar { padding: 0 22px; } }

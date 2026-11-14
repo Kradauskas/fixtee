@@ -125,7 +125,9 @@ proof entirely in the browser.
    and show the live Realtime badge (`SUBSCRIBED`).
 2. Open `https://<deploy url>/api/github/install` → install `fixtee-bot` on `Kradauskas/DemoFixtee`
    (never install both `fixtee-bot` and `fixtee-bot-dev` on the same repo) → GitHub returns you to
-   the Setup URL, which creates the `projects` row.
+   the Setup URL, which creates the `projects` row. Ensure the target repo's workflow uses unfiltered
+   `on: [push, pull_request]` (as in `fixtures/agent/demo-repo-test.yml`) so pushes to `autofix/*`
+   trigger CI for both `test_commit_sha` and `fix_commit_sha` before the PR opens.
 3. Verify **one bug at a time** on `DemoFixtee`'s `main` branch (keep `main` green initially, and
    never leave multiple unrelated failing Jest tests active in the same suite simultaneously, or a
    passing fix for Bug #1 will still fail CI because of Bug #2):

@@ -473,6 +473,51 @@ export function buildItems(data: DashboardData, projectId: string | null): Item[
     .map((error) => ({ error, fix: newest.get(error.id) ?? null }));
 }
 
+export const ALL_PROJECTS_ID = "all";
+
+export type ProjectSelection = string | null;
+
+export function mostRecentProjectId(data: DashboardData): string | null {
+  if (data.projects.length === 0) return null;
+  const knownIds = new Set(data.projects.map((project) => project.id));
+
+  let bestId: string | null = null;
+  let bestTs = -1;
+  for (const error of data.errors) {
+    if (!knownIds.has(error.project_id)) continue;
+    const ms = Date.parse(error.last_seen);
+    const ts = Number.isFinite(ms) ? ms : 0;
+    if (bestId === null || ts > bestTs) {
+      bestId = error.project_id;
+      bestTs = ts;
+    }
+  }
+
+  return bestId;
+}
+
+export function resolveProjectSelection(
+  data: DashboardData,
+  requestedProject?: string | null,
+): ProjectSelection {
+  if (data.projects.length === 0) return null;
+  if (data.projects.length === 1) return data.projects[0].id;
+
+  const trimmed = requestedProject?.trim();
+  if (trimmed) {
+    if (trimmed === ALL_PROJECTS_ID) return ALL_PROJECTS_ID;
+    const byId = data.projects.find((project) => project.id === trimmed);
+    if (byId) return byId.id;
+    const lower = trimmed.toLowerCase();
+    const bySlug = data.projects.find(
+      (project) => `${project.repo_owner}/${project.repo_name}`.toLowerCase() === lower,
+    );
+    if (bySlug) return bySlug.id;
+  }
+
+  return mostRecentProjectId(data) ?? ALL_PROJECTS_ID;
+}
+
 export const PENDING_VERIFICATION: FixStatus[] = ["test_pushed", "test_failed", "fix_pushed"];
 
 export function isPendingVerification(status: FixStatus): boolean {

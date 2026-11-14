@@ -6,17 +6,25 @@ import type { DashboardProject } from "./types";
 
 export function SettingsDialog({
   project,
+  projects,
   signedIn,
   userLabel,
   onClose,
   onSaved,
 }: {
   project: DashboardProject | null;
+  projects?: DashboardProject[];
   signedIn: boolean;
   userLabel?: string | null;
   onClose: () => void;
   onSaved: (message: string, tone: "success" | "warning") => void;
 }) {
+  const availableProjects = projects && projects.length > 0 ? projects : project ? [project] : [];
+  const [selectedId, setSelectedId] = useState<string>(
+    () => project?.id ?? availableProjects[0]?.id ?? "",
+  );
+  const targetProject =
+    availableProjects.find((entry) => entry.id === selectedId) ?? project ?? availableProjects[0] ?? null;
   const [key, setKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -30,7 +38,7 @@ export function SettingsDialog({
   }, [onClose]);
 
   const save = async () => {
-    if (!project) {
+    if (!targetProject) {
       onSaved("Connect a repository before saving a key.", "warning");
       onClose();
       return;
@@ -43,7 +51,7 @@ export function SettingsDialog({
     setSaving(true);
     setError(null);
     try {
-      const response = await fetch(`/api/projects/${project.id}/keys`, {
+      const response = await fetch(`/api/projects/${targetProject.id}/keys`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ llmApiKey: key }),
@@ -69,8 +77,10 @@ export function SettingsDialog({
         <header>
           <h2>Project &amp; BYOK settings</h2>
           <p>
-            {project ? `${project.repo_owner}/${project.repo_name}` : "No repository connected"} ·
-            project configuration
+            {targetProject
+              ? `${targetProject.repo_owner}/${targetProject.repo_name}`
+              : "No repository connected"}{" "}
+            · project configuration
           </p>
         </header>
 
@@ -78,22 +88,48 @@ export function SettingsDialog({
           <h3>
             <Github size={15} /> GitHub App installation
           </h3>
+          {availableProjects.length > 1 && (
+            <>
+              <label htmlFor="settings-project">Target repository</label>
+              <select
+                id="settings-project"
+                value={targetProject?.id ?? ""}
+                onChange={(event) => setSelectedId(event.target.value)}
+              >
+                {availableProjects.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.repo_owner}/{entry.repo_name}
+                  </option>
+                ))}
+              </select>
+            </>
+          )}
           <div className="settings-row">
             <code>
-              {project ? `${project.repo_owner}/${project.repo_name}` : "not connected"}
+              {targetProject
+                ? `${targetProject.repo_owner}/${targetProject.repo_name}`
+                : "not connected"}
             </code>
-            {project && <span className="status-badge tone-verified">Connected</span>}
+            {targetProject && <span className="status-badge tone-verified">Connected</span>}
           </div>
           <div className="settings-info">
-            {project
-              ? `Installation ${project.installation_id} · ${project.default_branch} branch`
+            {targetProject
+              ? `Installation ${targetProject.installation_id} · ${targetProject.default_branch} branch`
               : signedIn
                 ? "Install the Fixtee GitHub App or add repositories to start catching CI failures."
                 : "Already installed Fixtee? Sign in to load your repositories, or connect GitHub to install the App."}
           </div>
+          <div className="settings-info">
+            Workflow trigger requirement: use unfiltered{" "}
+            <code>on: [push, pull_request]</code> (no <code>branches: [main]</code>-only push
+            filter) so <code>autofix/*</code> commits run CI before the PR opens.
+          </div>
           <div className="settings-row" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
-            {signedIn || project ? (
-              <a className={project ? "pr-button-outline" : "pr-button"} href="/api/github/install">
+            {signedIn || targetProject ? (
+              <a
+                className={targetProject ? "pr-button-outline" : "pr-button"}
+                href="/api/github/install"
+              >
                 <Github size={14} />
                 Manage / Add GitHub repositories
                 <ArrowUpRight size={13} />
@@ -136,7 +172,7 @@ export function SettingsDialog({
             <KeyRound size={15} /> Bring your own LLM key
           </h3>
           <label htmlFor="llm-key">
-            {project?.has_llm_key ? "Replace the stored key" : "Anthropic Claude API key"}
+            {targetProject?.has_llm_key ? "Replace the stored key" : "Anthropic Claude API key"}
           </label>
           <input
             id="llm-key"
@@ -157,7 +193,12 @@ export function SettingsDialog({
           <button type="button" className="pr-button-outline" onClick={onClose}>
             Cancel
           </button>
-          <button type="button" className="pr-button" onClick={save} disabled={saving || !project}>
+          <button
+            type="button"
+            className="pr-button"
+            onClick={save}
+            disabled={saving || !targetProject}
+          >
             {saving ? <Loader size={14} className="spin" /> : <ShieldCheck size={14} />}
             Save settings
           </button>

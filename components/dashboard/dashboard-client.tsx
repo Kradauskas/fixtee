@@ -32,14 +32,17 @@ import {
 import { SettingsDialog } from "./settings-dialog";
 import { DashboardTheme } from "./theme";
 import {
+  ALL_PROJECTS_ID,
   buildItems,
   matchesFilter,
   matchesSearch,
   metrics,
+  resolveProjectSelection,
   type DashboardData,
   type DashboardFix,
   type FeedFilter,
   type Item,
+  type ProjectSelection,
 } from "./types";
 
 const SIMULATION_STEP_MS = 2000;
@@ -59,21 +62,37 @@ const FILTERS: { id: FeedFilter; label: string }[] = [
   { id: "failed", label: "Blocked" },
 ];
 
+function syncProjectUrlParam(selection: string | null) {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  if (selection) {
+    url.searchParams.set("project", selection);
+  } else {
+    url.searchParams.delete("project");
+  }
+  window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
 export function DashboardClient({
   initialData,
+  initialProject = null,
   signedIn,
   userLabel,
   notice,
   initialLoadError,
 }: {
   initialData: DashboardData;
+  initialProject?: string | null;
   signedIn: boolean;
   userLabel: string | null;
   notice: string | null;
   initialLoadError: string | null;
 }) {
   const [data, setData] = useState(initialData);
-  const [projectId, setProjectId] = useState<string | null>(initialData.projects[0]?.id ?? null);
+  const [selectedProject, setSelectedProject] = useState<ProjectSelection>(() =>
+    resolveProjectSelection(initialData, initialProject),
+  );
+  const [showSamples, setShowSamples] = useState(false);
   const [simulations, setSimulations] = useState<Item[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [filter, setFilter] = useState<FeedFilter>("all");
@@ -259,13 +278,36 @@ export function DashboardClient({
     return () => clearInterval(checkPending);
   }, [signedIn, sessionExpired, requestVerify]);
 
+  const effectiveSelection = useMemo<ProjectSelection>(() => {
+    if (data.projects.length === 0) return null;
+    if (data.projects.length === 1) return data.projects[0].id;
+    if (selectedProject === ALL_PROJECTS_ID) return ALL_PROJECTS_ID;
+    if (selectedProject && data.projects.some((row) => row.id === selectedProject)) {
+      return selectedProject;
+    }
+    return resolveProjectSelection(data, initialProject);
+  }, [data, selectedProject, initialProject]);
+
   const project = useMemo(
-    () => data.projects.find((row) => row.id === projectId) ?? data.projects[0] ?? null,
-    [data.projects, projectId],
+    () =>
+      effectiveSelection && effectiveSelection !== ALL_PROJECTS_ID
+        ? data.projects.find((row) => row.id === effectiveSelection) ?? null
+        : null,
+    [data.projects, effectiveSelection],
   );
 
-  const liveItems = useMemo(() => buildItems(data, project?.id ?? null), [data, project]);
-  const usingDemo = liveItems.length === 0 && simulations.length === 0;
+  const projectNamesById = useMemo(
+    () => new Map(data.projects.map((row) => [row.id, `${row.repo_owner}/${row.repo_name}`])),
+    [data.projects],
+  );
+
+  const hasConnectedRepos = signedIn && !sessionExpired && data.projects.length > 0;
+  const projectFilterId = project ? project.id : null;
+  const liveItems = useMemo(() => buildItems(data, projectFilterId), [data, projectFilterId]);
+  const usingDemo =
+    liveItems.length === 0 && simulations.length === 0 && (!hasConnectedRepos || showSamples);
+  const waitingForErrors =
+    hasConnectedRepos && liveItems.length === 0 && simulations.length === 0 && !showSamples;
   const items = useMemo(
     () => (usingDemo ? DEMO_ITEMS : [...simulations, ...liveItems]),
     [usingDemo, simulations, liveItems],
@@ -380,12 +422,17 @@ export function DashboardClient({
               <Github size={15} />
               <select
                 aria-label="Repository"
-                value={project?.id ?? ""}
+                value={effectiveSelection ?? ALL_PROJECTS_ID}
                 onChange={(event) => {
-                  setProjectId(event.target.value);
+                  const next = event.target.value;
+                  setSelectedProject(next);
                   setExpanded(null);
+                  syncProjectUrlParam(next);
                 }}
               >
+                <option value={ALL_PROJECTS_ID}>
+                  All repositories ({data.projects.length})
+                </option>
                 {data.projects.map((row) => (
                   <option key={row.id} value={row.id}>
                     {row.repo_owner}/{row.repo_name}
@@ -557,29 +604,81 @@ export function DashboardClient({
             </div>
           </div>
 
-          {usingDemo && (
-            <p className="settings-info">
-              {signedIn && !sessionExpired
-                ? "No CI failures recorded yet — showing a sample so you can explore the proof view."
-                : "Demo data. Sign in or connect GitHub to catch and verify failures from your own repositories."}
-            </p>
+          {waitingForErrors ? (
+            <div className="waiting-state">
+              <h2>
+                {project
+                  ? `Waiting for CI failures on ${project.repo_owner}/${project.repo_name}…`
+                  : "Waiting for CI failures across your connected repositories…"}
+              </h2>
+              <p>
+                {project
+                  ? "Realtime is listening for workflow_run failures. Push a failing commit or make sure your workflow uses on: [push, pull_request]."
+                  : `Monitoring ${data.projects.map((row) => `${row.repo_owner}/${row.repo_name}`).join(", ")} for failed workflow runs.`}
+              </p>
+              <div className="waiting-actions">
+                <button
+                  type="button"
+                  className="pr-button-outline"
+                  onClick={() => {
+                    setShowSamples(true);
+                    setExpanded(null);
+                  }}
+                >
+                  Load sample preview
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              {usingDemo && (
+                <div className="sample-banner">
+                  <span>
+                    {hasConnectedRepos
+                      ? `Sample preview — these mock items are not from ${project ? `${project.repo_owner}/${project.repo_name}` : "your connected repositories"}.`
+                      : signedIn && !sessionExpired
+                        ? "No repositories connected yet — showing sample data until you connect GitHub."
+                        : "Demo data. Sign in or connect GitHub to catch and verify failures from your own repositories."}
+                  </span>
+                  {hasConnectedRepos && (
+                    <button
+                      type="button"
+                      className="pr-button-outline"
+                      onClick={() => {
+                        setShowSamples(false);
+                        setExpanded(null);
+                      }}
+                    >
+                      Hide sample preview
+                    </button>
+                  )}
+                </div>
+              )}
+
+              <ul className="error-list">
+                {visible.map((item) => (
+                  <ErrorCard
+                    key={item.error.id}
+                    item={item}
+                    repoLabel={
+                      effectiveSelection === ALL_PROJECTS_ID && !item.demo
+                        ? projectNamesById.get(item.error.project_id)
+                        : null
+                    }
+                    open={openId === item.error.id}
+                    now={now}
+                    retrying={running}
+                    onToggle={() => setExpanded(openId === item.error.id ? "" : item.error.id)}
+                    onRetry={item.demo ? () => simulate(item) : undefined}
+                  />
+                ))}
+              </ul>
+
+              {items.length > 0 && visible.length === 0 && (
+                <p className="empty-note">No matching failures.</p>
+              )}
+            </>
           )}
-
-          <ul className="error-list">
-            {visible.map((item) => (
-              <ErrorCard
-                key={item.error.id}
-                item={item}
-                open={openId === item.error.id}
-                now={now}
-                retrying={running}
-                onToggle={() => setExpanded(openId === item.error.id ? "" : item.error.id)}
-                onRetry={item.demo ? () => simulate(item) : undefined}
-              />
-            ))}
-          </ul>
-
-          {visible.length === 0 && <p className="empty-note">No matching failures.</p>}
         </section>
 
         <footer className="app-footer">
@@ -594,8 +693,12 @@ export function DashboardClient({
               : simulations.length
                 ? "Simulated proof · no GitHub changes"
                 : usingDemo
-                  ? "Sample data"
-                  : "Live repository"}
+                  ? hasConnectedRepos
+                    ? "Sample preview"
+                    : "Sample data"
+                  : waitingForErrors
+                    ? "Live repository · waiting for CI"
+                    : "Live repository"}
             <ArrowUpRight size={10} />
           </div>
         </footer>
@@ -603,7 +706,8 @@ export function DashboardClient({
 
       {settingsOpen && (
         <SettingsDialog
-          project={project}
+          project={project ?? data.projects[0] ?? null}
+          projects={data.projects}
           signedIn={signedIn && !sessionExpired}
           userLabel={userLabel}
           onClose={() => setSettingsOpen(false)}

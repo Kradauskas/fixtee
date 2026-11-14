@@ -103,6 +103,7 @@ async function DashboardBody({ searchParams }: { searchParams: SearchParams }) {
   return (
     <DashboardClient
       initialData={session.data}
+      initialProject={first(params.project)}
       signedIn={session.signedIn}
       userLabel={session.userLabel}
       notice={installNotice(params)}

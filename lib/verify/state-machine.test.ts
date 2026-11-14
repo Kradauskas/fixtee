@@ -24,6 +24,7 @@ import {
   type GithubClient,
   type RunHint,
   type VerificationResult,
+  type WorkflowRunEntry,
 } from "./state-machine";
 import { handleVerifyRequest } from "../../app/api/verify/route";
 
@@ -34,7 +35,7 @@ const RED_RUN = "https://github.com/octo/demo/actions/runs/1";
 const GREEN_RUN = "https://github.com/octo/demo/actions/runs/2";
 const ORIG_RUN = "https://github.com/octo/demo/actions/runs/99";
 
-type WorkflowRun = { conclusion: string | null; html_url: string };
+type WorkflowRun = WorkflowRunEntry;
 
 type FixRow = {
   id: string;
@@ -144,6 +145,7 @@ type HarnessOptions = {
   guardLoses?: boolean;
   prBody?: string | null;
   prDraft?: boolean;
+  prState?: string;
   existingComments?: string[];
   failOn?: (operation: string) => Error | null | undefined;
 };
@@ -166,6 +168,7 @@ function harness(
   const prState = {
     body: opts.prBody ?? null,
     draft: opts.prDraft ?? true,
+    state: opts.prState ?? "open",
   };
   const matchedFix = branchMatch === undefined ? (row ? { id: row.id } : null) : branchMatch;
 
@@ -219,12 +222,26 @@ function harness(
         return { data: { id: comments.length } };
       }
       if (route.startsWith("GET /repos/{owner}/{repo}/pulls/")) {
-        return { data: { node_id: "PR_node_42", draft: prState.draft, body: prState.body } };
+        return {
+          data: {
+            node_id: "PR_node_42",
+            state: prState.state,
+            draft: prState.draft,
+            body: prState.body,
+          },
+        };
       }
       if (route.startsWith("PATCH /repos/{owner}/{repo}/pulls/")) {
         prState.body = String(params.body);
         prPatches.push({ pull_number: Number(params.pull_number), body: prState.body });
-        return { data: { node_id: "PR_node_42", draft: prState.draft, body: prState.body } };
+        return {
+          data: {
+            node_id: "PR_node_42",
+            state: prState.state,
+            draft: prState.draft,
+            body: prState.body,
+          },
+        };
       }
       throw new Error(`unexpected route ${route}`);
     },
@@ -274,6 +291,75 @@ describe("decideOutcome", () => {
 describe("pickRun", () => {
   it("prefers a failing run over a passing one for the same commit", () => {
     expect(pickRun([run("success", GREEN_RUN), run("failure", RED_RUN)])).toEqual({
+      conclusion: "failure",
+      runUrl: RED_RUN,
+    });
+  });
+
+  it("ignores stale failures when a later re-run on the same workflow_id succeeds", () => {
+    const staleTimedOut: WorkflowRun = {
+      id: 100,
+      workflow_id: 1,
+      run_attempt: 1,
+      created_at: "2026-11-14T00:00:00Z",
+      conclusion: "timed_out",
+      html_url: RED_RUN,
+    };
+    const rerunSuccess: WorkflowRun = {
+      id: 101,
+      workflow_id: 1,
+      run_attempt: 1,
+      created_at: "2026-11-14T00:05:00Z",
+      conclusion: "success",
+      html_url: GREEN_RUN,
+    };
+    expect(pickRun([staleTimedOut, rerunSuccess])).toEqual({
+      conclusion: "success",
+      runUrl: GREEN_RUN,
+    });
+    expect(pickRun([rerunSuccess, staleTimedOut])).toEqual({
+      conclusion: "success",
+      runUrl: GREEN_RUN,
+    });
+
+    const sameRunAttempt1: WorkflowRun = {
+      id: 200,
+      workflow_id: 2,
+      run_attempt: 1,
+      created_at: "2026-11-14T00:00:00Z",
+      conclusion: "failure",
+      html_url: RED_RUN,
+    };
+    const sameRunAttempt2: WorkflowRun = {
+      id: 200,
+      workflow_id: 2,
+      run_attempt: 2,
+      created_at: "2026-11-14T00:00:00Z",
+      conclusion: "success",
+      html_url: GREEN_RUN,
+    };
+    expect(pickRun([sameRunAttempt1, sameRunAttempt2])).toEqual({
+      conclusion: "success",
+      runUrl: GREEN_RUN,
+    });
+  });
+
+  it("still reports failure if a distinct workflow_id failed on its latest run", () => {
+    const wf1Pass: WorkflowRun = {
+      id: 10,
+      workflow_id: 1,
+      created_at: "2026-11-14T00:05:00Z",
+      conclusion: "success",
+      html_url: GREEN_RUN,
+    };
+    const wf2Fail: WorkflowRun = {
+      id: 11,
+      workflow_id: 2,
+      created_at: "2026-11-14T00:02:00Z",
+      conclusion: "startup_failure",
+      html_url: RED_RUN,
+    };
+    expect(pickRun([wf1Pass, wf2Fail])).toEqual({
       conclusion: "failure",
       runUrl: RED_RUN,
     });
@@ -862,6 +948,84 @@ describe("retry-safe GitHub ordering and rollback", () => {
     expect(h.getPrState().body).toContain(PR_DESCRIPTION_MARKER_START);
     expect(h.prPatches).toHaveLength(1);
     expect(h.comments).toHaveLength(1);
+  });
+
+  it("skips GraphQL ready mutation without throwing when PR is already closed or merged", async () => {
+    const h = harness(
+      fixRow(),
+      { [TEST_SHA]: [run("failure", RED_RUN)], [FIX_SHA]: [run("success", GREEN_RUN)] },
+      undefined,
+      { prBody: "", prDraft: true, prState: "closed" },
+    );
+
+    const result = await syncFixVerification("fix-1", h.deps);
+    expect(result).toMatchObject({
+      status: "verified",
+      commented: true,
+      markedReadyForReview: false,
+    });
+    expect(h.getRow()?.status).toBe("verified");
+    expect(h.graphqlCalls).toEqual([]);
+    expect(h.comments).toHaveLength(1);
+  });
+
+  it("skips GraphQL ready mutation cleanly when PR is already non-draft (e.g. GitHub Free private repo)", async () => {
+    const h = harness(
+      fixRow(),
+      { [TEST_SHA]: [run("failure", RED_RUN)], [FIX_SHA]: [run("success", GREEN_RUN)] },
+      undefined,
+      { prBody: "", prDraft: false, prState: "open" },
+    );
+
+    const result = await syncFixVerification("fix-1", h.deps);
+    expect(result).toMatchObject({
+      status: "verified",
+      commented: true,
+      markedReadyForReview: true,
+    });
+    expect(h.getRow()?.status).toBe("verified");
+    expect(h.graphqlCalls).toEqual([]);
+    expect(h.comments).toHaveLength(1);
+  });
+
+  it("verifies cleanly when fix commit CI was re-run after an earlier transient failure", async () => {
+    const h = harness(
+      fixRow(),
+      {
+        [TEST_SHA]: [{ workflow_id: 1, id: 50, conclusion: "failure", html_url: RED_RUN }],
+        [FIX_SHA]: [
+          {
+            workflow_id: 1,
+            id: 51,
+            run_attempt: 1,
+            created_at: "2026-11-14T00:00:00Z",
+            conclusion: "timed_out",
+            html_url: "https://github.com/octo/demo/actions/runs/51",
+          },
+          {
+            workflow_id: 1,
+            id: 52,
+            run_attempt: 1,
+            created_at: "2026-11-14T00:03:00Z",
+            conclusion: "success",
+            html_url: GREEN_RUN,
+          },
+        ],
+      },
+      undefined,
+      { prBody: "", prDraft: true },
+    );
+
+    const result = await syncFixVerification("fix-1", h.deps);
+    expect(result).toMatchObject({
+      status: "verified",
+      outcome: "verified",
+      fixRunUrl: GREEN_RUN,
+      commented: true,
+      markedReadyForReview: true,
+    });
+    expect(h.comments).toHaveLength(1);
+    expect(h.graphqlCalls).toHaveLength(1);
   });
 });
 

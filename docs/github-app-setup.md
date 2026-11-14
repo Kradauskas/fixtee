@@ -81,6 +81,10 @@ Notes:
   red/green CI verification relies on. (Only pushes made with Actions' own `GITHUB_TOKEN` don't.)
 - Contents: write does **not** allow editing files under `.github/workflows/`. That needs the separate
   *Workflows* permission, which we don't request. The agent must not touch workflow files.
+- **Target repo workflow triggers:** use `on: [push, pull_request]` (without a `branches: [main]`-only
+  filter on `push`), as in `fixtures/agent/demo-repo-test.yml`. The agent pushes `test_commit_sha`,
+  then `fix_commit_sha` to `autofix/<fix_id>` before opening the PR; workflows restricted to
+  `push: { branches: [main] }` will skip `test_commit_sha` and leave verification waiting forever.
 
 ### Subscribe to events
 - **Workflow run**: check it. The checkbox only appears after **Actions** permission is set above.

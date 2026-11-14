@@ -1,6 +1,15 @@
 "use client";
 
-import { Check, ChevronDown, CircleDot, FileCode, GitBranch, ShieldCheck, Zap } from "./icons";
+import {
+  Check,
+  ChevronDown,
+  CircleDot,
+  FileCode,
+  GitBranch,
+  Github,
+  ShieldCheck,
+  Zap,
+} from "./icons";
 import { Inspector } from "./inspector";
 import {
   confidenceLevel,
@@ -45,6 +54,7 @@ function ErrorMetrics({ item }: { item: Item }) {
 
 export function ErrorCard({
   item,
+  repoLabel,
   open,
   now,
   retrying,
@@ -52,6 +62,7 @@ export function ErrorCard({
   onRetry,
 }: {
   item: Item;
+  repoLabel?: string | null;
   open: boolean;
   now: number | null;
   retrying: boolean;
@@ -91,6 +102,12 @@ export function ErrorCard({
             )}
           </span>
           <span className="error-row-meta">
+            {repoLabel && (
+              <span>
+                <Github size={13} />
+                {repoLabel}
+              </span>
+            )}
             <span>
               <FileCode size={13} />
               {item.error.file_path ?? "unknown file"}
