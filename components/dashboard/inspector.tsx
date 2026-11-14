@@ -14,6 +14,9 @@ import {
 } from "./icons";
 import {
   elapsedSeconds,
+  failureKind,
+  fixExplanation,
+  githubRepoUrl,
   guardrailReason,
   isReady,
   parsePlannedChanges,
@@ -21,30 +24,53 @@ import {
   readableLog,
   runningTime,
   shortSha,
+  testPanelState,
   type Item,
 } from "./types";
 
 const STEP_ICONS = [Sparkles, TestTube, ShieldCheck];
 
-function explanation(item: Item) {
-  const fix = item.fix;
-  const blocked = Boolean(guardrailReason(item));
-  const why =
-    fix?.ai_reasoning ??
-    item.error.error_message ??
-    "The automated checks caught a failure on the default branch.";
-  const how = isReady(fix)
-    ? "A test recreated the bug, then the code change passed every check."
-    : blocked
-      ? "No fix was pushed. The reproduction did not prove the bug, so Fixtee blocked the change rather than send an unproven fix for review."
-      : "Fixtee is checking the proposed change before sending it for review.";
-  return { why, how };
-}
-
 function DiffPanel({ item }: { item: Item }) {
   const changes = parsePlannedChanges(item.fix?.planned_changes ?? null);
+  const fix = item.fix;
+  const status = fix?.status ?? "queued";
 
   if (changes.length === 0) {
+    if (fix?.fix_commit_sha) {
+      const repoUrl = githubRepoUrl(item);
+      const linkUrl = repoUrl
+        ? `${repoUrl}/commit/${fix.fix_commit_sha}`
+        : fix.pr_url
+          ? `${fix.pr_url}/files`
+          : null;
+      return (
+        <div className="blocked-explanation" style={{ flexWrap: "wrap", justifyContent: "space-between" }}>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+            <FileCode size={15} /> Fix commit {shortSha(fix.fix_commit_sha)} is on{" "}
+            {fix.branch_name ?? "the fix branch"}.
+          </span>
+          {linkUrl && (
+            <a
+              className="pr-button-outline"
+              href={linkUrl}
+              target="_blank"
+              rel="noreferrer noopener"
+            >
+              View fix commit <ArrowUpRight size={13} />
+            </a>
+          )}
+        </div>
+      );
+    }
+
+    if (status === "queued" || status === "analyzing") {
+      return (
+        <p className="blocked-explanation">
+          <Sparkles size={15} /> Generating fix diff...
+        </p>
+      );
+    }
+
     return (
       <p className="blocked-explanation">
         <ShieldCheck size={15} /> No code change was pushed. Your repository is unchanged.
@@ -84,14 +110,29 @@ function TestPanel({ item }: { item: Item }) {
   const source = reproductionFor(item);
 
   if (!source) {
-    const sha = item.fix?.test_commit_sha ?? null;
+    const state = testPanelState(item);
     return (
-      <p className="blocked-explanation">
-        <TestTube size={15} />
-        {sha
-          ? `The reproduction test lives on ${item.fix?.branch_name ?? "the fix branch"}, commit ${shortSha(sha)}.`
-          : "An existing test in the repository already reproduced this failure, so Fixtee did not add one."}
-      </p>
+      <div className="blocked-explanation" style={{ flexWrap: "wrap", justifyContent: "space-between" }}>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+          <TestTube size={15} />
+          {state.message}
+        </span>
+        {state.links.length > 0 && (
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            {state.links.map((link) => (
+              <a
+                key={link.url}
+                className="pr-button-outline"
+                href={link.url}
+                target="_blank"
+                rel="noreferrer noopener"
+              >
+                {link.label} <ArrowUpRight size={13} />
+              </a>
+            ))}
+          </span>
+        )}
+      </div>
     );
   }
 
@@ -134,11 +175,12 @@ export function Inspector({
   }, []);
 
   const fix = item.fix;
+  const kind = failureKind(item);
   const reason = guardrailReason(item);
   const blocked = Boolean(reason);
   const ready = isReady(fix) && !blocked;
   const steps = proofSteps(item);
-  const summary = explanation(item);
+  const summary = fixExplanation(item);
 
   return (
     <article className="inspector">
@@ -157,7 +199,9 @@ export function Inspector({
             View draft on GitHub <ArrowUpRight size={14} />
           </a>
         ) : (
-          <span className="run-unavailable">Checks in progress</span>
+          <span className="run-unavailable">
+            {blocked ? "No PR opened" : "Checks in progress"}
+          </span>
         )}
       </header>
 
@@ -170,7 +214,9 @@ export function Inspector({
               <p>
                 {item.demo
                   ? "Retry creates a separate demo analysis. GitHub stays unchanged."
-                  : "Human review is required before another analysis."}
+                  : kind === "agent_error"
+                    ? "Check the failure details and logs below before re-running CI."
+                    : "Human review is required before another analysis."}
               </p>
             </div>
             {onRetry && (
@@ -264,7 +310,7 @@ export function Inspector({
               <p>{summary.why}</p>
             </div>
             <div>
-              <h4>{ready ? "How we fixed it" : blocked ? "Why we blocked it" : "The proposed fix"}</h4>
+              <h4>{summary.howHeading}</h4>
               <p>{summary.how}</p>
             </div>
           </div>
@@ -272,7 +318,15 @@ export function Inspector({
 
         <section>
           <div className="diff-heading">
-            <h3>{ready ? "The code change" : blocked ? "No code change pushed" : "Proposed code change"}</h3>
+            <h3>
+              {ready
+                ? "The code change"
+                : kind === "fix_failed_ci"
+                  ? "Proposed code change (CI failed)"
+                  : blocked
+                    ? "No code change pushed"
+                    : "Proposed code change"}
+            </h3>
             {ready && (
               <span>
                 <ShieldCheck size={12} /> All checks passed

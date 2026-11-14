@@ -66,44 +66,293 @@ export function isReady(fix: DashboardFix | null): boolean {
   return fix?.status === "verified";
 }
 
+export type FailureKind =
+  | "agent_error"
+  | "low_confidence"
+  | "fix_failed_ci"
+  | "guardrail_test_passed";
+
+export function isAgentCrash(fix: DashboardFix | null): boolean {
+  return Boolean(fix?.ai_reasoning?.trimStart().startsWith("Failed:"));
+}
+
+export function failureKind(item: Item): FailureKind | null {
+  const fix = item.fix;
+  if (!fix || fix.status !== "failed") return null;
+  if (isAgentCrash(fix)) return "agent_error";
+  if (fix.confidence !== null && fix.confidence <= 0.3) return "low_confidence";
+  if (fix.fix_commit_sha !== null) return "fix_failed_ci";
+  if (fix.pr_url === null) return "agent_error";
+  return "guardrail_test_passed";
+}
+
 export function guardrailReason(item: Item): string | null {
   const fix = item.fix;
-  if (!fix) return null;
-  if (fix.status === "failed") {
-    return fix.confidence !== null && fix.confidence <= 0.3
-      ? `Guardrail triggered: low confidence (${Math.round(fix.confidence * 100)}%) — needs human review, ${fix.pr_url ? "PR kept as Draft" : "no PR opened"}`
-      : "Reproduction test did not prove the bug — PR kept as Draft";
+  const kind = failureKind(item);
+  if (!fix || !kind) return null;
+
+  const prOutcome = fix.pr_url ? "PR kept as Draft" : "no PR opened";
+  switch (kind) {
+    case "low_confidence":
+      return `Guardrail triggered: low confidence (${Math.round((fix.confidence ?? 0) * 100)}%) — needs human review, ${prOutcome}`;
+    case "fix_failed_ci":
+      return `Fix failed CI checks${fix.fix_commit_sha ? ` on ${shortSha(fix.fix_commit_sha)}` : ""} — ${fix.pr_url ? "PR kept as Draft" : "needs human review"}`;
+    case "agent_error":
+      return `Agent analysis failed — ${prOutcome}`;
+    case "guardrail_test_passed":
+      return `Guardrail triggered: reproduction test passed without the fix — ${prOutcome}`;
   }
-  return null;
 }
 
 export function redProven(fix: DashboardFix | null): boolean {
   if (!fix) return false;
-  return fix.status === "fix_pushed" || fix.status === "verified" || Boolean(fix.red_run_url);
+  return (
+    fix.status === "test_failed" ||
+    fix.status === "fix_pushed" ||
+    fix.status === "verified" ||
+    Boolean(fix.red_run_url)
+  );
 }
 
 export function statusLabel(item: Item): string {
-  if (guardrailReason(item)) return "Guardrail blocked";
+  const kind = failureKind(item);
+  if (kind === "fix_failed_ci") return "Fix failed CI";
+  if (kind === "agent_error") return "Analysis failed";
+  if (kind) return "Guardrail blocked";
   if (isReady(item.fix)) return "Verified · PR ready";
   return "Fix in progress";
+}
+
+export type FixExplanation = {
+  why: string;
+  how: string;
+  howHeading: string;
+};
+
+export function fixExplanation(item: Item): FixExplanation {
+  const fix = item.fix;
+  const status = fix?.status ?? "queued";
+  const kind = failureKind(item);
+  const why =
+    fix?.ai_reasoning ??
+    item.error.error_message ??
+    "The automated checks caught a failure on the default branch.";
+
+  if (isReady(fix)) {
+    return {
+      why,
+      howHeading: "How we fixed it",
+      how: "A test recreated the bug, then the code change passed every check.",
+    };
+  }
+
+  if (kind) {
+    switch (kind) {
+      case "fix_failed_ci":
+        return {
+          why,
+          howHeading: "Why CI failed",
+          how: "The reproduction test confirmed the bug and Fixtee pushed a fix commit, but CI checks still failed. The PR remains a draft for human review.",
+        };
+      case "guardrail_test_passed":
+        return {
+          why,
+          howHeading: "Why we blocked it",
+          how: "The reproduction test passed without applying any fix, so Fixtee blocked the change and kept the PR as a draft rather than send an unproven fix for review.",
+        };
+      case "low_confidence":
+        return {
+          why,
+          howHeading: "Why we blocked it",
+          how: fix?.pr_url
+            ? "Agent confidence was too low to prove a safe fix, so Fixtee kept the PR as a draft for human review."
+            : "No PR was opened. Agent confidence was too low to confirm a safe fix, so Fixtee blocked the change rather than send an unproven fix for review.",
+        };
+      case "agent_error":
+        return {
+          why,
+          howHeading: "Why analysis failed",
+          how: isAgentCrash(fix)
+            ? "Fixtee encountered an error while analyzing the failure before opening a pull request, so no code changes were pushed."
+            : "Fixtee stopped before opening a pull request, so no code changes were pushed to the repository.",
+        };
+    }
+  }
+
+  if (status === "queued" || status === "analyzing") {
+    return {
+      why,
+      howHeading: "The proposed fix",
+      how: "Fixtee is analyzing the failing CI logs and generating a reproduction test.",
+    };
+  }
+
+  if (status === "test_pushed") {
+    return {
+      why,
+      howHeading: "The proposed fix",
+      how: "Fixtee pushed a reproduction test and is waiting for CI to confirm the failure.",
+    };
+  }
+
+  return {
+    why,
+    howHeading: "The proposed fix",
+    how: "Fixtee is checking the proposed change before sending it for review.",
+  };
+}
+
+export function githubRepoUrl(item: Item): string | null {
+  for (const candidate of [item.fix?.pr_url, item.error.run_url]) {
+    if (!candidate) continue;
+    const match = candidate.match(/^(https?:\/\/[^/]+\/[^/]+\/[^/]+)(?:\/|$)/);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+export type TestPanelLink = { label: string; url: string };
+
+export type TestPanelState = {
+  kind: "generating" | "committed" | "existing_test" | "not_generated";
+  message: string;
+  links: TestPanelLink[];
+};
+
+export function testPanelState(item: Item): TestPanelState {
+  const fix = item.fix;
+  const status = fix?.status ?? "queued";
+  const repoUrl = githubRepoUrl(item);
+
+  if (status === "queued" || status === "analyzing") {
+    return {
+      kind: "generating",
+      message: "Generating reproduction test...",
+      links: [],
+    };
+  }
+
+  const sha = fix?.test_commit_sha ?? null;
+  if (sha) {
+    const links: TestPanelLink[] = [];
+    if (repoUrl) {
+      links.push({ label: `View commit ${shortSha(sha)}`, url: `${repoUrl}/commit/${sha}` });
+    }
+    if (fix?.pr_url) {
+      links.push({ label: "View PR files", url: `${fix.pr_url}/files` });
+    } else if (repoUrl && fix?.branch_name) {
+      links.push({ label: "Browse branch", url: `${repoUrl}/tree/${fix.branch_name}` });
+    }
+    return {
+      kind: "committed",
+      message: `The reproduction test lives on ${fix?.branch_name ?? "the fix branch"}, commit ${shortSha(sha)}.`,
+      links,
+    };
+  }
+
+  const kind = failureKind(item);
+  const reusedExistingTest =
+    fix !== null &&
+    (fix.fix_commit_sha !== null ||
+      status === "fix_pushed" ||
+      status === "verified" ||
+      (Boolean(fix.red_run_url) && status !== "failed"));
+
+  if (reusedExistingTest) {
+    const links: TestPanelLink[] = [];
+    if (repoUrl && item.error.file_path) {
+      const cleanPath = item.error.file_path.replace(/^\/+/, "");
+      const isTestFile = /\.(?:test|spec)\.(m?[jt]sx?)$/.test(cleanPath);
+      links.push({
+        label: isTestFile ? "View test on GitHub" : "View failing file",
+        url: `${repoUrl}/blob/${item.error.commit_sha}/${cleanPath}`,
+      });
+    }
+    if (fix?.pr_url) {
+      links.push({ label: "View PR", url: fix.pr_url });
+    } else if (repoUrl && fix?.branch_name) {
+      links.push({ label: "Browse branch", url: `${repoUrl}/tree/${fix.branch_name}` });
+    }
+    return {
+      kind: "existing_test",
+      message:
+        "An existing test in the repository already reproduced this failure, so Fixtee did not add one.",
+      links,
+    };
+  }
+
+  if (kind || status === "failed") {
+    const links: TestPanelLink[] = [];
+    if (fix?.pr_url) links.push({ label: "View draft PR", url: fix.pr_url });
+    return {
+      kind: "not_generated",
+      message: "No reproduction test was pushed because analysis stopped before creating commits.",
+      links,
+    };
+  }
+
+  return {
+    kind: "generating",
+    message: "Generating reproduction test...",
+    links: [],
+  };
 }
 
 export function proofSteps(item: Item): ProofStep[] {
   const fix = item.fix;
   const status = fix?.status ?? "queued";
-  const blocked = Boolean(guardrailReason(item));
+  const kind = failureKind(item);
+  const blocked = Boolean(kind);
   const ready = isReady(fix) && !blocked;
-  const red = redProven(fix) && !blocked;
-  const diagnosed = Boolean(fix?.ai_reasoning) && status !== "queued" && status !== "analyzing";
-  const reusesExistingTest = Boolean(fix) && fix?.test_commit_sha === null && redProven(fix);
+  const crash = isAgentCrash(fix);
+  const failedBeforeDiagnosis = status === "failed" && (crash || !fix?.ai_reasoning);
+  const diagnosed =
+    Boolean(fix?.ai_reasoning) && !crash && status !== "queued" && status !== "analyzing";
+
+  const red =
+    kind === "fix_failed_ci"
+      ? true
+      : redProven(fix) && !blocked;
+  const reusesExistingTest = Boolean(fix) && fix?.test_commit_sha === null && red;
+
+  const step2Description =
+    kind === "fix_failed_ci"
+      ? reusesExistingTest
+        ? "An existing test already failed"
+        : "Test failed as expected"
+      : blocked
+        ? kind === "guardrail_test_passed"
+          ? "Passed without fix"
+          : kind === "agent_error"
+            ? failedBeforeDiagnosis
+              ? "Skipped after analysis error"
+              : "No reproduction run completed"
+            : "Needs human review"
+        : red
+          ? reusesExistingTest
+            ? "An existing test already failed"
+            : "Test failed as expected"
+          : "Waiting for the failing test";
+
+  const step3Description = ready
+    ? "All checks passed"
+    : blocked
+      ? kind === "fix_failed_ci"
+        ? "Fix failed CI checks"
+        : kind === "agent_error"
+          ? "No PR opened"
+          : "Fix safely blocked"
+      : "Waiting for passing checks";
 
   return [
     {
       title: "Bug Diagnosed",
-      description: diagnosed
-        ? `Root cause in ${item.error.file_path ?? "the failing module"}`
-        : "Finding the root cause",
-      tone: diagnosed ? "diagnosed" : "pending",
+      description: failedBeforeDiagnosis
+        ? "Analysis failed before diagnosis"
+        : diagnosed
+          ? `Root cause in ${item.error.file_path ?? "the failing module"}`
+          : "Finding the root cause",
+      tone: failedBeforeDiagnosis ? "blocked" : diagnosed ? "diagnosed" : "pending",
       complete: diagnosed,
       running: !blocked && (status === "queued" || status === "analyzing"),
       sha: null,
@@ -112,14 +361,8 @@ export function proofSteps(item: Item): ProofStep[] {
     },
     {
       title: "Failing Test Proven 🔴",
-      description: blocked
-        ? "Needs human review"
-        : red
-          ? reusesExistingTest
-            ? "An existing test already failed"
-            : "Test failed as expected"
-          : "Waiting for the failing test",
-      tone: blocked ? "blocked" : red ? "reproduced" : "pending",
+      description: step2Description,
+      tone: red ? "reproduced" : blocked ? "blocked" : "pending",
       complete: red,
       running: !blocked && status === "test_pushed",
       sha: fix?.test_commit_sha ?? null,
@@ -128,11 +371,7 @@ export function proofSteps(item: Item): ProofStep[] {
     },
     {
       title: "Fix Passed CI 🟢",
-      description: ready
-        ? "All checks passed"
-        : blocked
-          ? "Fix safely blocked"
-          : "Waiting for passing checks",
+      description: step3Description,
       tone: ready ? "resolved" : blocked ? "blocked" : "pending",
       complete: ready,
       running: !blocked && status === "fix_pushed",

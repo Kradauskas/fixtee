@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { Db } from "../../../lib/db/supabase";
+import { testFileName } from "../../../components/dashboard/demo-data";
 import {
+  failureKind,
+  fixExplanation,
+  githubRepoUrl,
   guardrailReason,
   matchesFilter,
   matchesSearch,
@@ -8,6 +12,8 @@ import {
   parsePlannedChanges,
   proofSteps,
   redProven,
+  statusLabel,
+  testPanelState,
   type DashboardError,
   type DashboardFix,
   type Item,
@@ -458,10 +464,244 @@ describe("proofSteps", () => {
 
     const steps = proofSteps(item);
 
+    expect(failureKind(item)).toBe("low_confidence");
+    expect(statusLabel(item)).toBe("Guardrail blocked");
     expect(guardrailReason(item)).toContain("Guardrail triggered");
+    expect(guardrailReason(item)).toContain("no PR opened");
+    expect(steps[0].complete).toBe(true);
+    expect(steps[0].tone).toBe("diagnosed");
     expect(steps[1].tone).toBe("blocked");
     expect(steps[1].complete).toBe(false);
     expect(steps[2].tone).toBe("blocked");
     expect(steps.every((step) => !step.running)).toBe(true);
+  });
+
+  it("clears the Step 1 checkmark when status is failed with an agent crash message (pr_url === null)", () => {
+    const item = asItem({
+      status: "failed",
+      pr_url: null,
+      fix_commit_sha: null,
+      test_commit_sha: null,
+      confidence: null,
+      ai_reasoning: "Failed: [step_limit] Agent reached the step limit without submitting a fix.",
+    });
+
+    const steps = proofSteps(item);
+    const explanation = fixExplanation(item);
+
+    expect(failureKind(item)).toBe("agent_error");
+    expect(statusLabel(item)).toBe("Analysis failed");
+    expect(guardrailReason(item)).toBe("Agent analysis failed — no PR opened");
+    expect(explanation.howHeading).toBe("Why analysis failed");
+    expect(explanation.how).not.toContain("reproduction did not prove");
+    expect(steps[0].complete).toBe(false);
+    expect(steps[0].tone).toBe("blocked");
+    expect(steps[0].running).toBe(false);
+    expect(steps[0].description).toBe("Analysis failed before diagnosis");
+    expect(steps[1].complete).toBe(false);
+    expect(steps[1].tone).toBe("blocked");
+    expect(steps[2].complete).toBe(false);
+    expect(steps[2].tone).toBe("blocked");
+    expect(steps[2].description).toBe("No PR opened");
+  });
+
+  it("handles a failed fix after diagnosis when pr_url === null", () => {
+    const item = asItem({
+      status: "failed",
+      pr_url: null,
+      fix_commit_sha: null,
+      confidence: 0.9,
+      ai_reasoning: "Missing null check\n\nRoot cause:\nCart items can be undefined.",
+    });
+
+    const steps = proofSteps(item);
+
+    expect(failureKind(item)).toBe("agent_error");
+    expect(guardrailReason(item)).toBe("Agent analysis failed — no PR opened");
+    expect(steps[0].complete).toBe(true);
+    expect(steps[0].tone).toBe("diagnosed");
+    expect(steps[1].complete).toBe(false);
+    expect(steps[2].description).toBe("No PR opened");
+  });
+
+  it("differentiates fix_failed_ci (fix_commit_sha !== null) from guardrail blocks", () => {
+    const item = asItem(
+      {
+        status: "failed",
+        ai_reasoning: "Subtract percent/100 instead of price * percent/100",
+        confidence: 0.92,
+        branch_name: "autofix/fix-1",
+        pr_url: "https://github.com/octo/demo/pull/5",
+        test_commit_sha: "aaaaaaa1111111",
+        fix_commit_sha: "bbbbbbb2222222",
+        red_run_url: "https://github.com/octo/demo/actions/runs/100",
+      },
+      { run_url: "https://github.com/octo/demo/actions/runs/99" },
+    );
+
+    const steps = proofSteps(item);
+    const explanation = fixExplanation(item);
+
+    expect(failureKind(item)).toBe("fix_failed_ci");
+    expect(statusLabel(item)).toBe("Fix failed CI");
+    expect(guardrailReason(item)).toBe("Fix failed CI checks on bbbbbbb — PR kept as Draft");
+    expect(explanation.howHeading).toBe("Why CI failed");
+    expect(explanation.how).toContain("pushed a fix commit, but CI checks still failed");
+    expect(steps[0].complete).toBe(true);
+    expect(steps[1].complete).toBe(true);
+    expect(steps[1].tone).toBe("reproduced");
+    expect(steps[1].runUrl).toBe("https://github.com/octo/demo/actions/runs/100");
+    expect(steps[2].complete).toBe(false);
+    expect(steps[2].tone).toBe("blocked");
+    expect(steps[2].sha).toBe("bbbbbbb2222222");
+    expect(steps[2].description).toBe("Fix failed CI checks");
+  });
+
+  it("differentiates guardrail_test_passed when PR stays draft without fix_commit_sha", () => {
+    const item = asItem(
+      {
+        status: "failed",
+        ai_reasoning: "Flaky timing test",
+        confidence: 0.42,
+        pr_url: "https://github.com/octo/demo/pull/4",
+        test_commit_sha: "ccccccc3333333",
+        fix_commit_sha: null,
+      },
+      { run_url: "https://github.com/octo/demo/actions/runs/50" },
+    );
+
+    const steps = proofSteps(item);
+    const explanation = fixExplanation(item);
+
+    expect(failureKind(item)).toBe("guardrail_test_passed");
+    expect(statusLabel(item)).toBe("Guardrail blocked");
+    expect(guardrailReason(item)).toBe(
+      "Guardrail triggered: reproduction test passed without the fix — PR kept as Draft",
+    );
+    expect(explanation.howHeading).toBe("Why we blocked it");
+    expect(steps[1].tone).toBe("blocked");
+    expect(steps[1].complete).toBe(false);
+    expect(steps[1].description).toBe("Passed without fix");
+  });
+});
+
+describe("testPanelState", () => {
+  it("reports generating state for queued, analyzing, and missing-fix items", () => {
+    const noFix: Item = { error: asError({}), fix: null };
+    const queued = asItem({ status: "queued" });
+    const analyzing = asItem({ status: "analyzing" });
+
+    for (const candidate of [noFix, queued, analyzing]) {
+      const state = testPanelState(candidate);
+      expect(state.kind).toBe("generating");
+      expect(state.message).toBe("Generating reproduction test...");
+      expect(state.links).toEqual([]);
+      expect(fixExplanation(candidate).how).toContain("generating a reproduction test");
+    }
+  });
+
+  it("reports not_generated for failed fixes with pr_url === null and no test commit", () => {
+    const item = asItem({
+      status: "failed",
+      pr_url: null,
+      test_commit_sha: null,
+      fix_commit_sha: null,
+      ai_reasoning: "Failed: missing key",
+    });
+
+    const state = testPanelState(item);
+    expect(state.kind).toBe("not_generated");
+    expect(state.message).not.toContain("existing test");
+    expect(state.links).toEqual([]);
+  });
+
+  it("builds GitHub links for committed reproduction tests using branch_name, test_commit_sha, and pr_url", () => {
+    const withPr = asItem(
+      {
+        status: "test_pushed",
+        branch_name: "autofix/fix-1",
+        test_commit_sha: "abcdef1234567890",
+        pr_url: "https://github.com/octo/demo/pull/7",
+      },
+      { run_url: "https://github.com/octo/demo/actions/runs/70" },
+    );
+
+    expect(githubRepoUrl(withPr)).toBe("https://github.com/octo/demo");
+    expect(testPanelState(withPr)).toEqual({
+      kind: "committed",
+      message: "The reproduction test lives on autofix/fix-1, commit abcdef1.",
+      links: [
+        { label: "View commit abcdef1", url: "https://github.com/octo/demo/commit/abcdef1234567890" },
+        { label: "View PR files", url: "https://github.com/octo/demo/pull/7/files" },
+      ],
+    });
+
+    const branchOnly = asItem(
+      {
+        status: "test_pushed",
+        branch_name: "autofix/fix-2",
+        test_commit_sha: "1234567890abcdef",
+        pr_url: null,
+      },
+      { run_url: "https://github.com/octo/demo/actions/runs/71" },
+    );
+    expect(testPanelState(branchOnly).links).toEqual([
+      { label: "View commit 1234567", url: "https://github.com/octo/demo/commit/1234567890abcdef" },
+      { label: "Browse branch", url: "https://github.com/octo/demo/tree/autofix/fix-2" },
+    ]);
+  });
+
+  it("reports existing_test with GitHub links when fix_commit_sha exists without test_commit_sha", () => {
+    const item = asItem(
+      {
+        status: "failed",
+        test_commit_sha: null,
+        fix_commit_sha: "bbbbbbb2",
+        pr_url: "https://github.com/octo/demo/pull/8",
+        red_run_url: "https://github.com/octo/demo/actions/runs/80",
+      },
+      {
+        file_path: "src/discount.test.js",
+        commit_sha: "mainsha123",
+        run_url: "https://github.com/octo/demo/actions/runs/80",
+      },
+    );
+
+    const state = testPanelState(item);
+    expect(state.kind).toBe("existing_test");
+    expect(state.message).toContain("existing test in the repository already reproduced");
+    expect(state.links).toEqual([
+      {
+        label: "View test on GitHub",
+        url: "https://github.com/octo/demo/blob/mainsha123/src/discount.test.js",
+      },
+      { label: "View PR", url: "https://github.com/octo/demo/pull/8" },
+    ]);
+    expect(testFileName(item)).toBe("src/discount.test.js");
+
+    const sourceFileItem = asItem(
+      {
+        status: "verified",
+        test_commit_sha: null,
+        fix_commit_sha: "ddddddd4",
+        branch_name: "autofix/fix-9",
+        pr_url: null,
+      },
+      {
+        file_path: "src/cart.js",
+        commit_sha: "mainsha456",
+        run_url: "https://github.com/octo/demo/actions/runs/81",
+      },
+    );
+    expect(testPanelState(sourceFileItem).links).toEqual([
+      {
+        label: "View failing file",
+        url: "https://github.com/octo/demo/blob/mainsha456/src/cart.js",
+      },
+      {
+        label: "Browse branch",
+        url: "https://github.com/octo/demo/tree/autofix/fix-9",
+      },
+    ]);
   });
 });

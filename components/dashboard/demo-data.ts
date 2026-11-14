@@ -156,5 +156,6 @@ export function reproductionFor(item: Item): string | null {
 export function testFileName(item: Item): string {
   const path = item.error.file_path;
   if (!path) return "reproduction.test.js";
+  if (/\.(?:test|spec)\.(m?[jt]sx?)$/.test(path)) return path;
   return path.replace(/\.(m?[jt]sx?)$/, ".test.$1");
 }
