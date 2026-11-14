@@ -115,9 +115,10 @@ https://fixtee-git-<branch-with-dashes>-<scope>.vercel.app
 Preview deployments need the same environment variables (the Preview scope) and the Supabase
 wildcard redirect from section 4.
 
-An empty database is enough to see the dashboard: with zero recorded errors it falls back to sample
-items, and **Simulate live CI failure** animates the full queued → analyzing → test → fix → verified
-proof entirely in the browser.
+When signed out with no connected repository, the dashboard falls back to sample items; once you
+connect a repository with zero recorded errors yet, it shows a clean `Waiting for CI failures…`
+empty state (with a **Load sample preview** button) and **Simulate live CI failure** animates the
+full queued → analyzing → test → fix → verified proof entirely in the browser.
 
 ## 7. Check it works (E2E on `Kradauskas/DemoFixtee`)
 
