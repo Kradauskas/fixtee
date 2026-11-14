@@ -11,23 +11,31 @@ settings, so it cannot be scripted from the repo.
 
 ---
 
-## 1. Import the repository
+## 1. Import the repository (or deploy via CLI)
 
 1. Sign in at <https://vercel.com> with GitHub.
-2. **Add New → Project** → import `Kradauskas/fixtee`.
+2. **Add New → Project** → import `Kradauskas/fixtee` (or deploy manually with `npx vercel --prod` as described in [`github-app-setup.md`](./github-app-setup.md#7-deploy-to-vercel-production-app) if GitHub repo permissions block Vercel Git integration).
 3. Leave every build setting at its default. Vercel detects Next.js and runs `next build`; there is
    no `vercel.json` and none is needed.
-4. Do **not** deploy yet — add the environment variables first, or the first build will fail on the
-   missing Supabase keys.
+4. Do **not** deploy yet — apply the Supabase migrations and add the environment variables first, or
+   the first build will fail on the missing `NEXT_PUBLIC_SUPABASE_*` keys.
 
-Production tracks `main`. Every other branch gets its own preview URL automatically, which is how
-you can look at an unmerged branch (see [section 6](#6-looking-at-a-branch-before-merging)).
+Production tracks `main`. Every other branch gets its own preview URL when deployed (see
+[section 6](#6-looking-at-a-branch-before-merging)).
 
-## 2. Environment variables
+## 2. Database migrations and environment variables
 
-**Settings → Environment Variables.** Add each to **Production, Preview and Development** unless
-noted. Only `NEXT_PUBLIC_*` values reach the browser; everything else stays server side, so never
-rename a secret to `NEXT_PUBLIC_`.
+Before the first deploy, apply both SQL migrations in `supabase/migrations/` to your target
+Supabase project:
+
+- `supabase/migrations/20261113160000_initial_schema.sql` — tables, Vault LLM key helpers, RLS
+  `SELECT` policies, and the `supabase_realtime` publication for `public.errors` and `public.fixes`.
+- `supabase/migrations/20261113220000_one_active_fix_per_error.sql` — deduplicates active fixes per
+  error.
+
+In Vercel: **Settings → Environment Variables.** Add each to **Production, Preview and
+Development** unless noted. Only `NEXT_PUBLIC_*` values reach the browser; everything else stays
+server side, so never rename a secret to `NEXT_PUBLIC_`.
 
 | Variable | Where it comes from |
 | --- | --- |
@@ -41,8 +49,13 @@ rename a secret to `NEXT_PUBLIC_`.
 | `GITHUB_WEBHOOK_SECRET` | the webhook secret set on the GitHub App. **Secret** |
 | `ANTHROPIC_API_KEY` | fallback LLM key for projects with no key of their own. **Secret** |
 
-Optional, only for the PAT fallback used by `scripts/run-pr.ts` when a project has no GitHub App
-installation: `GITHUB_TOKEN` and `GITHUB_REPO`. The deployed app does not need them.
+Optional variables in `.env.example`:
+
+- `AGENT_MODEL` / `AGENT_MAX_STEPS` — override the defaults in `lib/agent/agent.ts`.
+- `ELEVENLABS_API_KEY` — reserved in `.env.example` for voice alerts (audio alert hooks are not
+  wired into `main` yet, so omitting it will not affect builds or runtime).
+- `GITHUB_TOKEN` and `GITHUB_REPO` — PAT fallback for local `scripts/run-pr.ts` only; the deployed
+  app does not need them.
 
 ### Pasting the private key
 
@@ -58,8 +71,9 @@ message that names the variable but never echoes key material.
 
 ## 3. First deploy
 
-Deploy, then note the production URL — `https://<project>.vercel.app`. Add a custom domain now if
-you want one, because the next two sections hard-code this URL in two external services.
+Deploy (`npx vercel --prod` or trigger a Vercel Git deploy), then note the production URL —
+`https://<project>.vercel.app`. Add a custom domain now if you want one, because the next two
+sections hard-code this URL in two external services.
 
 ## 4. Point Supabase Auth at the deployment
 
@@ -76,43 +90,56 @@ The GitHub OAuth app behind Supabase keeps its existing callback
 
 ## 5. Point the GitHub App at the deployment
 
-**GitHub → Settings → Developer settings → GitHub Apps → Fixtee:**
+**GitHub → Settings → Developer settings → GitHub Apps → Fixtee (`fixtee-bot`):**
 
 | Field | Value |
 | --- | --- |
 | Webhook URL | `https://<deploy url>/api/github/webhook` |
 | Setup URL | `https://<deploy url>/api/github/setup` |
 
-Webhooks go straight to the deployment now, so smee is only needed for local development. The
-`proxy.ts` matcher already excludes `/api/github/webhook` from session refresh, and the route
-verifies `x-hub-signature-256` against `GITHUB_WEBHOOK_SECRET` before anything else runs.
+Webhooks go straight to the deployment now, so smee is only needed for local development (with a
+separate `fixtee-bot-dev` app). The `proxy.ts` matcher already excludes `/api/github/webhook` from
+session refresh, and the route verifies `x-hub-signature-256` against `GITHUB_WEBHOOK_SECRET` before
+anything else runs.
 
 ## 6. Looking at a branch before merging
 
-Production builds `main`, which still has Role 1's placeholder dashboard. Unmerged work lives on
-preview URLs:
+`main` already includes the live Realtime dashboard (`DashboardClient`), verification state machine
+(`lib/verify/state-machine.ts`), and PR description/comment updater. For any future unmerged feature
+branch, Vercel creates a preview URL:
 
 ```
 https://fixtee-git-<branch-with-dashes>-<scope>.vercel.app
 ```
 
-So the dashboard redesign on `r3/dashboard-ui` is reachable at its own preview URL as soon as the
-branch is pushed, without merging anything. Preview deployments need the same environment variables
-(the Preview scope) and the Supabase wildcard redirect from section 4.
+Preview deployments need the same environment variables (the Preview scope) and the Supabase
+wildcard redirect from section 4.
 
 An empty database is enough to see the dashboard: with zero recorded errors it falls back to sample
 items, and **Simulate live CI failure** animates the full queued → analyzing → test → fix → verified
 proof entirely in the browser.
 
-## 7. Check it works
+## 7. Check it works (E2E on `Kradauskas/DemoFixtee`)
 
-1. Open `https://<deploy url>/dashboard` → it should bounce you through GitHub sign-in and back.
-2. Open `https://<deploy url>/api/github/install` → install the app on a repo → GitHub returns you
-   to the Setup URL, which creates the `projects` rows.
-3. Push a failing test to that repo's default branch. Within a few seconds the GitHub App's
-   **Advanced → Recent Deliveries** tab should show a `workflow_run` delivery with a 202, and the
-   error should appear on the dashboard.
-4. Vercel → Logs to follow `ingest:`, `webhook:` and `verify:` lines for a run.
+1. Open `https://<deploy url>/dashboard` → it should bounce you through GitHub sign-in and back,
+   and show the live Realtime badge (`SUBSCRIBED`).
+2. Open `https://<deploy url>/api/github/install` → install `fixtee-bot` on `Kradauskas/DemoFixtee`
+   (never install both `fixtee-bot` and `fixtee-bot-dev` on the same repo) → GitHub returns you to
+   the Setup URL, which creates the `projects` row.
+3. Verify **one bug at a time** on `DemoFixtee`'s `main` branch (keep `main` green initially, and
+   never leave multiple unrelated failing Jest tests active in the same suite simultaneously, or a
+   passing fix for Bug #1 will still fail CI because of Bug #2):
+   - Push Bug #1 to `main` → GitHub Actions runs Jest and fails → the GitHub App's **Advanced →
+     Recent Deliveries** shows `workflow_run` `202` → `/dashboard` receives `errors` + `fixes`
+     changes live via Realtime without a page reload.
+   - Watch the agent open a Draft PR on `autofix/<fix_id>` → Red CI fails on `test_commit_sha` →
+     Green CI passes on `fix_commit_sha` → verification populates the PR's
+     `<!-- fixtee-verification -->` description section and summary comment with Red/Green CI links
+     and marks the PR Ready for Review.
+   - Repeat for Bug #2 and the guardrail scenario (e.g., an unreproduced or low-confidence failure
+     that leaves the PR as Draft / `failed`).
+4. Check Vercel → Logs (`npx vercel logs <deploy url>`) to follow `ingest:`, `webhook:` and `verify:`
+   lines for a run.
 
 ## Notes
 
