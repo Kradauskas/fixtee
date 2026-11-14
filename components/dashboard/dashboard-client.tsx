@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getBrowserClient } from "../../lib/db/browser";
 import { DEMO_ITEMS } from "./demo-data";
 import { ErrorCard } from "./error-card";
 import {
@@ -18,11 +19,20 @@ import {
   ShieldCheck,
   Zap,
 } from "./icons";
+import {
+  applyRealtimeChange,
+  formatConnectionLabel,
+  getPollIntervalMs,
+  shouldAutoVerifyFix,
+  subscribeDashboardRealtime,
+  verifyFixAndSync,
+  VERIFY_FALLBACK_INTERVAL_MS,
+  type RealtimeStatus,
+} from "./realtime";
 import { SettingsDialog } from "./settings-dialog";
 import { DashboardTheme } from "./theme";
 import {
   buildItems,
-  isPendingVerification,
   matchesFilter,
   matchesSearch,
   metrics,
@@ -32,7 +42,6 @@ import {
   type Item,
 } from "./types";
 
-const POLL_INTERVAL_MS = 5000;
 const SIMULATION_STEP_MS = 2000;
 const SIMULATION_STAGES: DashboardFix["status"][] = [
   "analyzing",
@@ -71,14 +80,28 @@ export function DashboardClient({
   const [query, setQuery] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(initialLoadError);
-  const [connection, setConnection] = useState(
-    !signedIn ? "Demo · not signed in" : initialLoadError ? "Reconnecting…" : "Live · GitHub Actions",
+  const [sessionExpired, setSessionExpired] = useState(false);
+  const [offline, setOffline] = useState(false);
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>(() =>
+    !signedIn ? "signed_out" : initialLoadError ? "reconnecting" : "connecting",
   );
   const [running, setRunning] = useState(false);
   const [now, setNow] = useState<number | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const inFlight = useRef<Set<string>>(new Set());
+  const lastVerifyAttempt = useRef<Map<string, number>>(new Map());
+  const fixesById = useRef<Map<string, DashboardFix>>(new Map());
+  const loadSeq = useRef(0);
+  const realtimeEpoch = useRef(0);
+  const initialLoadErrorRef = useRef(initialLoadError);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const connection = formatConnectionLabel({
+    signedIn,
+    sessionExpired,
+    offline,
+    realtimeStatus,
+  });
 
   const pushToast = useCallback((message: string, tone: Toast["tone"] = "info") => {
     const id = Date.now() + Math.random();
@@ -98,56 +121,143 @@ export function DashboardClient({
 
   useEffect(() => () => (timer.current ? clearInterval(timer.current) : undefined), []);
 
-  const load = useCallback(async () => {
+  useEffect(() => {
+    fixesById.current = new Map(data.fixes.map((fix) => [fix.id, fix]));
+  }, [data.fixes]);
+
+  const load = useCallback(async ({ force = false }: { force?: boolean } = {}) => {
+    const seq = ++loadSeq.current;
+    const epochAtStart = realtimeEpoch.current;
+
     try {
       const response = await fetch("/api/dashboard", { cache: "no-store" });
+      if (seq !== loadSeq.current) return;
+
       if (response.status === 401) {
         setLoadError("Your session expired. Reload the page to sign in again.");
-        setConnection("Signed out");
+        setSessionExpired(true);
+        setOffline(false);
         return;
       }
       if (!response.ok) {
         setLoadError("Could not refresh the dashboard.");
-        setConnection("Reconnecting…");
+        setOffline(false);
         return;
       }
-      setData((await response.json()) as DashboardData);
+
+      const next = (await response.json()) as DashboardData;
+      if (seq !== loadSeq.current) return;
+      if (!force && epochAtStart !== realtimeEpoch.current) return;
+
+      setData(next);
       setLoadError(null);
-      setConnection("Live · GitHub Actions");
+      setSessionExpired(false);
+      setOffline(false);
     } catch {
+      if (seq !== loadSeq.current) return;
       setLoadError("Could not reach the server.");
-      setConnection("Offline");
+      setOffline(true);
     }
   }, []);
 
   useEffect(() => {
-    if (!signedIn) return;
-    const poll = setInterval(() => void load(), POLL_INTERVAL_MS);
-    return () => clearInterval(poll);
-  }, [signedIn, load]);
+    if (!signedIn || sessionExpired) return;
 
-  const requestVerify = useCallback(async (fixId: string) => {
-    if (inFlight.current.has(fixId)) return;
-    inFlight.current.add(fixId);
+    let supabase;
     try {
-      await fetch("/api/verify", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ fixId }),
-      });
-    } catch {
-      return;
-    } finally {
-      inFlight.current.delete(fixId);
+      supabase = getBrowserClient();
+    } catch (err) {
+      console.warn(
+        "dashboard: browser Realtime unavailable, falling back to polling",
+        err instanceof Error ? err.message : err,
+      );
+      const id = setTimeout(() => setRealtimeStatus("unavailable"), 0);
+      return () => clearTimeout(id);
     }
-  }, []);
+
+    return subscribeDashboardRealtime(supabase, {
+      syncOnInitialSubscribe: Boolean(initialLoadErrorRef.current),
+      onStatusChange: (status) => {
+        setRealtimeStatus(status);
+        if (status === "subscribed") {
+          setLoadError(null);
+          setOffline(false);
+        }
+      },
+      onChange: (table, payload) => {
+        realtimeEpoch.current += 1;
+        setData((current) => {
+          const result = applyRealtimeChange(current, table, payload);
+          return result.changed ? result.data : current;
+        });
+      },
+      onReconnectSync: () => {
+        void load({ force: true });
+      },
+      onErrorLog: (message, err) => {
+        console.warn(message, err);
+      },
+    });
+  }, [signedIn, sessionExpired, load]);
 
   useEffect(() => {
-    if (!signedIn) return;
-    for (const fix of data.fixes) {
-      if (isPendingVerification(fix.status)) void requestVerify(fix.id);
-    }
-  }, [signedIn, data, requestVerify]);
+    if (!signedIn || sessionExpired) return;
+    const poll = setInterval(() => void load(), getPollIntervalMs(realtimeStatus));
+    return () => clearInterval(poll);
+  }, [signedIn, sessionExpired, realtimeStatus, load]);
+
+  const needsParentRefresh = useMemo(() => {
+    const projectIds = new Set(data.projects.map((row) => row.id));
+    if (data.errors.some((row) => !projectIds.has(row.project_id))) return true;
+    const errorIds = new Set(data.errors.map((row) => row.id));
+    return data.fixes.some((row) => !errorIds.has(row.error_id));
+  }, [data.projects, data.errors, data.fixes]);
+
+  useEffect(() => {
+    if (!signedIn || sessionExpired || !needsParentRefresh) return;
+    const refresh = setTimeout(() => void load({ force: true }), 150);
+    return () => clearTimeout(refresh);
+  }, [signedIn, sessionExpired, needsParentRefresh, load]);
+
+  const requestVerify = useCallback(
+    async (fixId: string) => {
+      if (inFlight.current.has(fixId)) return;
+      inFlight.current.add(fixId);
+      lastVerifyAttempt.current.set(fixId, Date.now());
+      const previous = fixesById.current.get(fixId);
+
+      try {
+        await verifyFixAndSync({
+          fixId,
+          previous,
+          onTransitioned: () => load({ force: true }),
+          onSessionExpired: () => {
+            setLoadError("Your session expired. Reload the page to sign in again.");
+            setSessionExpired(true);
+          },
+        });
+      } finally {
+        inFlight.current.delete(fixId);
+      }
+    },
+    [load],
+  );
+
+  useEffect(() => {
+    if (!signedIn || sessionExpired) return;
+    const checkPending = setInterval(() => {
+      const nowMs = Date.now();
+      for (const [id, fix] of fixesById.current) {
+        if (shouldAutoVerifyFix(fix, nowMs, lastVerifyAttempt.current.get(id))) {
+          void requestVerify(id);
+        }
+      }
+      for (const id of lastVerifyAttempt.current.keys()) {
+        if (!fixesById.current.has(id)) lastVerifyAttempt.current.delete(id);
+      }
+    }, VERIFY_FALLBACK_INTERVAL_MS);
+    return () => clearInterval(checkPending);
+  }, [signedIn, sessionExpired, requestVerify]);
 
   const project = useMemo(
     () => data.projects.find((row) => row.id === projectId) ?? data.projects[0] ?? null,
@@ -323,8 +433,21 @@ export function DashboardClient({
             <p>Your CI failures, caught and verified. Zero guesswork.</p>
           </div>
           <div className="heading-actions">
-            <div className="live-status">
-              <span className="live-dot" />
+            <div className="live-status" data-status={realtimeStatus}>
+              <span
+                className="live-dot"
+                style={
+                  sessionExpired || offline
+                    ? { background: "var(--destructive)", boxShadow: "none", animation: "none" }
+                    : signedIn && realtimeStatus !== "subscribed"
+                      ? {
+                          background: "var(--warning)",
+                          boxShadow:
+                            "0 0 0 4px color-mix(in oklab, var(--warning) 12%, transparent)",
+                        }
+                      : undefined
+                }
+              />
               {connection}
             </div>
             <button
@@ -448,7 +571,7 @@ export function DashboardClient({
           onClose={() => setSettingsOpen(false)}
           onSaved={(message, tone) => {
             pushToast(message, tone);
-            void load();
+            void load({ force: true });
           }}
         />
       )}
