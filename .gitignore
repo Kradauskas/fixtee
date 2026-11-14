@@ -40,3 +40,6 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 !.env.example
+
+# local design reference, never deploy or commit
+/pixel-perfect-echo-7216/
