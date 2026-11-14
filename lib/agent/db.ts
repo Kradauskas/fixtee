@@ -1,6 +1,7 @@
 import type { Json, Tables, TablesUpdate } from "@/lib/db/types";
 import { getServiceClient } from "@/lib/db/supabase";
 import type { AgentOutput } from "@/lib/agent/types";
+import { STATUS_ORDER } from "../db/fix-status";
 
 /** Service-role client (bypasses RLS). Server-side only. */
 const db = getServiceClient;
@@ -75,7 +76,7 @@ export async function findQueuedFix(errorId: string): Promise<FixRow | null> {
  * only ever moves the status to a later step, never back. "failed" is terminal and is only
  * allowed before the fix is pushed; it never replaces fix_pushed/verified.
  */
-const STATUS_ORDER: readonly FixStatus[] = ["queued", "analyzing", "test_pushed", "test_failed", "fix_pushed", "verified"];
+export { STATUS_ORDER };
 
 /** Statuses from which a fix may move to `target` (strictly earlier steps; "failed" is never left). */
 export function statusesBefore(target: FixStatus): FixStatus[] {

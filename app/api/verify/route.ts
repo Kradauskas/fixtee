@@ -5,6 +5,7 @@ import {
   syncFixVerification,
   verifyFixByBranch,
   type FixBranchRef,
+  type RunHint,
   type VerificationResult,
 } from "../../../lib/verify/state-machine";
 
@@ -30,7 +31,7 @@ const uuidSchema = z.uuid();
 
 export type VerifyRouteDeps = {
   getUserClient: () => Promise<Db>;
-  syncFix: (fixId: string) => Promise<VerificationResult>;
+  syncFix: (fixId: string, hint?: RunHint) => Promise<VerificationResult>;
   verifyBranch: (ref: FixBranchRef) => Promise<VerificationResult | null>;
 };
 
@@ -74,11 +75,24 @@ export async function handleVerifyRequest(
   const ownerId = byFixId ? target.fixId : target.projectId;
   if (!uuidSchema.safeParse(ownerId).success) return notFound();
 
+  const hint: RunHint | undefined =
+    target.headSha !== undefined || target.conclusion !== undefined || target.runUrl !== undefined
+      ? {
+          ...(target.headSha !== undefined ? { headSha: target.headSha } : {}),
+          ...(target.conclusion !== undefined ? { conclusion: target.conclusion } : {}),
+          ...(target.runUrl !== undefined ? { runUrl: target.runUrl } : {}),
+        }
+      : undefined;
+
   try {
     const visible = await ownsRow(supabase, byFixId ? "fixes" : "projects", ownerId);
     if (!visible) return notFound();
 
-    const result = byFixId ? await deps.syncFix(target.fixId) : await deps.verifyBranch(target);
+    const result = byFixId
+      ? hint
+        ? await deps.syncFix(target.fixId, hint)
+        : await deps.syncFix(target.fixId)
+      : await deps.verifyBranch(target);
     if (!result) {
       return NextResponse.json(
         { message: "no fix awaiting verification for this branch" },
@@ -101,7 +115,7 @@ export async function POST(request: NextRequest) {
   return handleVerifyRequest(
     {
       getUserClient: createUserClient,
-      syncFix: (fixId) => syncFixVerification(fixId),
+      syncFix: (fixId, hint) => syncFixVerification(fixId, undefined, hint),
       verifyBranch: (ref) => verifyFixByBranch(ref),
     },
     request,

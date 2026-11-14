@@ -5,7 +5,12 @@
  */
 import { getServiceClient } from "../db/supabase";
 import { getInstallationOctokit } from "../github/app";
-import { type FixBranchRef, type VerificationResult, verifyFixByBranch } from "../verify/state-machine";
+import {
+  type FixBranchRef,
+  normalizeConclusion,
+  type VerificationResult,
+  verifyFixByBranch,
+} from "../verify/state-machine";
 import { fetchFailedJobLogs } from "../github/logs";
 import { fingerprint } from "./fingerprint";
 import { parseJestLog } from "./parse-jest";
@@ -132,9 +137,15 @@ export async function handleAutofixRun(
     return;
   }
   try {
-    const ref = { projectId: ctx.projectId, branchName: ctx.headBranch };
+    const ref: FixBranchRef = {
+      projectId: ctx.projectId,
+      branchName: ctx.headBranch,
+      headSha: ctx.headSha,
+      conclusion: ctx.conclusion,
+      runUrl: ctx.runUrl,
+    };
     let result = await verify(ref);
-    const final = ctx.conclusion === "success" || ctx.conclusion === "failure";
+    const final = normalizeConclusion(ctx.conclusion) !== null;
     for (const delay of final ? retryDelaysMs : []) {
       if (!result || SETTLED.has(result.status)) break;
       await sleep(delay);

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { FixBranchRef, VerificationResult } from "../verify/state-machine";
-import { type WorkflowRunContext, fixIdFromBranch, handleAutofixRun } from "./failed-run";
+import type { VerificationResult } from "../verify/state-machine";
+import { type VerifyByBranch, type WorkflowRunContext, fixIdFromBranch, handleAutofixRun } from "./failed-run";
 
 const FIX_ID = "f3ac06c4-8f52-4aa2-b893-2f6b407b7ba7";
 const PROJECT_ID = "5624ebdd-87da-45b5-ae78-9ed0a2927a1c";
+const HEAD_SHA = "f88ce47000000000000000000000000000000000";
+const RUN_URL = "https://github.com/Symantas/fixtee-test/actions/runs/43494480530";
 
 function ctx(over: Partial<WorkflowRunContext> = {}): WorkflowRunContext {
   return {
@@ -14,8 +16,8 @@ function ctx(over: Partial<WorkflowRunContext> = {}): WorkflowRunContext {
     repo: "fixtee-test",
     runId: 43494480530,
     runAttempt: 1,
-    runUrl: "https://github.com/Symantas/fixtee-test/actions/runs/43494480530",
-    headSha: "f88ce47000000000000000000000000000000000",
+    runUrl: RUN_URL,
+    headSha: HEAD_SHA,
     headBranch: `autofix/${FIX_ID}`,
     conclusion: "success",
     workflowName: "test",
@@ -47,13 +49,16 @@ describe("fixIdFromBranch", () => {
 });
 
 describe("handleAutofixRun", () => {
-  it("asks Role 3's verifyFixByBranch to verify the fix in this project", async () => {
+  it("asks Role 3's verifyFixByBranch to verify the fix in this project with the run hint", async () => {
     vi.spyOn(console, "info").mockImplementation(() => {});
-    const verify = vi.fn(async (_ref: FixBranchRef) => verified);
+    const verify = vi.fn<VerifyByBranch>(async () => verified);
     await handleAutofixRun(ctx(), verify);
     expect(verify).toHaveBeenCalledExactlyOnceWith({
       projectId: PROJECT_ID,
       branchName: `autofix/${FIX_ID}`,
+      headSha: HEAD_SHA,
+      conclusion: "success",
+      runUrl: RUN_URL,
     });
   });
 
@@ -71,6 +76,18 @@ describe("handleAutofixRun", () => {
     await handleAutofixRun(ctx(), verify, [0, 0]);
     expect(verify).toHaveBeenCalledTimes(2);
   });
+
+  it.each(["timed_out", "startup_failure", "action_required"])(
+    "treats %s as a final conclusion eligible for retries",
+    async (conclusion) => {
+      vi.spyOn(console, "info").mockImplementation(() => {});
+      const pending = { ...verified, status: "fix_pushed" as const, outcome: "test_reproduced" as const };
+      const failed = { ...verified, status: "failed" as const, outcome: "fix_failed_ci" as const };
+      const verify = vi.fn().mockResolvedValueOnce(pending).mockResolvedValueOnce(failed);
+      await handleAutofixRun(ctx({ conclusion }), verify, [0, 0]);
+      expect(verify).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it("gives up after the retry delays if the fix still isn't settled", async () => {
     vi.spyOn(console, "info").mockImplementation(() => {});

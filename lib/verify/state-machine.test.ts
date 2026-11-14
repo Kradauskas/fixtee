@@ -1,6 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/db/supabase", () => ({ getServiceClient: () => ({}) }));
+vi.mock("@/lib/github/app", () => ({ getInstallationOctokit: async () => ({}) }));
+
+import { canAdvanceStatus } from "../agent/db";
+import { buildPrBody } from "../agent/github";
 import type { Db } from "../db/supabase";
 import {
+  allowedSourceStatuses,
+  buildUpdatedPrBody,
   createVerifyDeps,
   decideOutcome,
   handleAgentCiResult,
@@ -8,16 +16,21 @@ import {
   normalizeConclusion,
   pickRun,
   syncFixVerification,
+  VERIFICATION_COMMENT_MARKER,
   verifyFixByBranch,
+  type FixStatus,
   type GithubClient,
+  type RunHint,
   type VerificationResult,
 } from "./state-machine";
 import { handleVerifyRequest } from "../../app/api/verify/route";
 
 const TEST_SHA = "aaaaaaa1111111111111111111111111111111111";
 const FIX_SHA = "bbbbbbb2222222222222222222222222222222222";
+const BASE_SHA = "ccccccc3333333333333333333333333333333333";
 const RED_RUN = "https://github.com/octo/demo/actions/runs/1";
 const GREEN_RUN = "https://github.com/octo/demo/actions/runs/2";
+const ORIG_RUN = "https://github.com/octo/demo/actions/runs/99";
 
 type WorkflowRun = { conclusion: string | null; html_url: string };
 
@@ -64,7 +77,7 @@ type SelectBuilder = {
   maybeSingle: () => Promise<{ data: unknown; error: null }>;
 };
 
-function selectBuilder(data: unknown, filters: Filter[]): SelectBuilder {
+function selectBuilder(getData: () => unknown, filters: Filter[]): SelectBuilder {
   const builder: SelectBuilder = {
     eq: (column, value) => {
       filters.push([column, value]);
@@ -76,49 +89,90 @@ function selectBuilder(data: unknown, filters: Filter[]): SelectBuilder {
     },
     order: () => builder,
     limit: () => builder,
-    maybeSingle: async () => ({ data, error: null }),
+    maybeSingle: async () => ({ data: getData(), error: null }),
   };
   return builder;
 }
 
 type UpdateBuilder = {
+  eq: (column: string, value: unknown) => UpdateBuilder;
   in: (column: string, values: unknown) => UpdateBuilder;
   select: (columns: string) => Promise<{ data: { id: string }[]; error: null }>;
 };
 
 function updateBuilder(
+  getRow: () => FixRow | null,
   patch: Record<string, unknown>,
   patches: Record<string, unknown>[],
   filters: Filter[],
   guardLoses: boolean,
 ): UpdateBuilder {
-  let guarded = false;
+  const rowChecks: Filter[] = [];
+  let guardedIn = false;
   const self: UpdateBuilder = {
+    eq: (column, value) => {
+      rowChecks.push([column, value]);
+      if (column !== "id") filters.push([column, value]);
+      return self;
+    },
     in: (column, values) => {
-      guarded = true;
+      guardedIn = true;
+      rowChecks.push([column, values]);
       filters.push([column, values]);
       return self;
     },
     select: async () => {
-      if (guarded && guardLoses) return { data: [], error: null };
+      if (guardedIn && guardLoses) return { data: [], error: null };
+      const current = getRow();
+      if (!current) return { data: [], error: null };
+      const matches = rowChecks.every(([column, expected]) => {
+        const actual = (current as unknown as Record<string, unknown>)[column];
+        return Array.isArray(expected) ? expected.includes(actual) : actual === expected;
+      });
+      if (!matches) return { data: [], error: null };
+      Object.assign(current, patch);
       patches.push(patch);
-      return { data: [{ id: "fix-1" }], error: null };
+      return { data: [{ id: current.id }], error: null };
     },
   };
   return self;
+}
+
+type HarnessOptions = {
+  guardLoses?: boolean;
+  prBody?: string | null;
+  prDraft?: boolean;
+  existingComments?: string[];
+  failOn?: (operation: string) => Error | null | undefined;
+};
+
+function cloneValue<T>(value: T): T {
+  return value === null || value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
 }
 
 function harness(
   row: FixRow | null,
   runsBySha: Record<string, WorkflowRun[]> = {},
   branchMatch: { id: string } | null | undefined = undefined,
-  guardLoses = false,
+  guardLosesOrOptions: boolean | HarnessOptions = false,
 ) {
+  const opts: HarnessOptions =
+    typeof guardLosesOrOptions === "boolean"
+      ? { guardLoses: guardLosesOrOptions }
+      : guardLosesOrOptions;
+  let currentRow = cloneValue(row);
+  const prState = {
+    body: opts.prBody ?? null,
+    draft: opts.prDraft ?? true,
+  };
   const matchedFix = branchMatch === undefined ? (row ? { id: row.id } : null) : branchMatch;
 
   const updateFilters: Filter[] = [];
   const patches: Record<string, unknown>[] = [];
-  const comments: { issue_number: number; body: string }[] = [];
+  const prPatches: { pull_number: number; body: string }[] = [];
+  const comments: { issue_number: number; body: string }[] = (opts.existingComments ?? []).map(
+    (body) => ({ issue_number: row?.pr_number ?? 42, body }),
+  );
   const graphqlCalls: { query: string; variables: Record<string, unknown> }[] = [];
   const routes: string[] = [];
   const runLookups: string[] = [];
@@ -129,32 +183,53 @@ function harness(
     from: () => ({
       select: (columns: string) =>
         columns.includes("errors!inner")
-          ? selectBuilder(matchedFix, lookupFilters)
-          : selectBuilder(row, loadFilters),
-      update: (patch: Record<string, unknown>) => ({
-        eq: () => updateBuilder(patch, patches, updateFilters, guardLoses),
-      }),
+          ? selectBuilder(() => {
+              if (!matchedFix) return null;
+              if (currentRow && NON_TERMINAL_STATUSES.includes(currentRow.status as FixStatus)) {
+                return matchedFix;
+              }
+              return currentRow ? null : matchedFix;
+            }, lookupFilters)
+          : selectBuilder(() => cloneValue(currentRow), loadFilters),
+      update: (patch: Record<string, unknown>) =>
+        updateBuilder(() => currentRow, patch, patches, updateFilters, opts.guardLoses ?? false),
     }),
   } as unknown as Db;
 
   const github: GithubClient = {
     async request(route, params) {
       routes.push(route);
+      const injected = opts.failOn?.(route);
+      if (injected) throw injected;
+
       if (route.endsWith("/actions/runs")) {
         const sha = String(params.head_sha);
         runLookups.push(sha);
         return { data: { workflow_runs: runsBySha[sha] ?? [] } };
       }
+      if (route.startsWith("GET") && route.endsWith("/comments")) {
+        return {
+          data: comments.map((comment, idx) => ({ id: idx + 1, body: comment.body })),
+        };
+      }
       if (route.startsWith("POST") && route.endsWith("/comments")) {
         comments.push({ issue_number: Number(params.issue_number), body: String(params.body) });
-        return { data: { id: 1 } };
+        return { data: { id: comments.length } };
       }
       if (route.startsWith("GET /repos/{owner}/{repo}/pulls/")) {
-        return { data: { node_id: "PR_node_42" } };
+        return { data: { node_id: "PR_node_42", draft: prState.draft, body: prState.body } };
+      }
+      if (route.startsWith("PATCH /repos/{owner}/{repo}/pulls/")) {
+        prState.body = String(params.body);
+        prPatches.push({ pull_number: Number(params.pull_number), body: prState.body });
+        return { data: { node_id: "PR_node_42", draft: prState.draft, body: prState.body } };
       }
       throw new Error(`unexpected route ${route}`);
     },
     async graphql(query, variables) {
+      const injected = opts.failOn?.("GRAPHQL");
+      if (injected) throw injected;
+      prState.draft = false;
       graphqlCalls.push({ query, variables });
       return {};
     },
@@ -165,7 +240,13 @@ function harness(
 
   return {
     deps,
+    getRow: () => cloneValue(currentRow),
+    setRow: (next: FixRow | null) => {
+      currentRow = cloneValue(next);
+    },
+    getPrState: () => ({ ...prState }),
     patches,
+    prPatches,
     comments,
     graphqlCalls,
     routes,
@@ -465,13 +546,169 @@ describe("settling a fix exactly once", () => {
     expect(h.updateFilters).toContainEqual(["status", NON_TERMINAL_STATUSES]);
   });
 
-  it("writes a non-terminal status without the guard", async () => {
+  it("guards a non-terminal status write with allowedSourceStatuses", async () => {
     const h = harness(fixRow({ status: "test_pushed" }), { [TEST_SHA]: [run("failure", RED_RUN)] });
 
     await syncFixVerification("fix-1", h.deps);
 
     expect(h.patches).toEqual([{ status: "fix_pushed", red_run_url: RED_RUN }]);
-    expect(h.updateFilters).toEqual([]);
+    expect(h.updateFilters).toContainEqual(["status", allowedSourceStatuses("fix_pushed")]);
+  });
+
+  it("moves test_pushed -> test_failed when fix_commit_sha is null so Role 2 can still mark failed", async () => {
+    const h = harness(
+      fixRow({ status: "test_pushed", fix_commit_sha: null, pr_number: null, pr_url: null }),
+      { [TEST_SHA]: [run("failure", RED_RUN)] },
+    );
+
+    const result = await syncFixVerification("fix-1", h.deps);
+
+    expect(result).toMatchObject({
+      status: "test_failed",
+      outcome: "test_reproduced",
+      testRunUrl: RED_RUN,
+      commented: false,
+      markedReadyForReview: false,
+    });
+    expect(h.patches).toEqual([{ status: "test_failed", red_run_url: RED_RUN }]);
+    expect(h.updateFilters).toContainEqual(["status", allowedSourceStatuses("test_failed")]);
+    expect(canAdvanceStatus(result.status, "failed")).toBe(true);
+    expect(canAdvanceStatus(result.status, "fix_pushed")).toBe(true);
+    expect(h.comments).toEqual([]);
+    expect(h.prPatches).toEqual([]);
+  });
+
+  it("never moves status backwards from fix_pushed to test_failed", async () => {
+    const h = harness(
+      fixRow({ status: "fix_pushed", fix_commit_sha: null, red_run_url: RED_RUN }),
+      { [TEST_SHA]: [run("failure", RED_RUN)] },
+    );
+
+    const result = await syncFixVerification("fix-1", h.deps);
+
+    expect(result.status).toBe("fix_pushed");
+    expect(h.patches).toEqual([]);
+  });
+
+  it("rejects stale test_failed DB write when a concurrent writer already moved to fix_pushed", async () => {
+    const h = harness(
+      fixRow({ status: "test_pushed", fix_commit_sha: null, pr_number: null, pr_url: null }),
+      { [TEST_SHA]: [run("failure", RED_RUN)] },
+    );
+    const originalFindCompletedRun = h.deps.findCompletedRun;
+    const deps = {
+      ...h.deps,
+      async findCompletedRun(fix: Parameters<typeof originalFindCompletedRun>[0], sha: string) {
+        const res = await originalFindCompletedRun(fix, sha);
+        // Simulate Role 2 concurrently advancing DB to fix_pushed before saveStatus runs.
+        h.setRow({ ...h.getRow()!, status: "fix_pushed", fix_commit_sha: FIX_SHA, pr_number: 42 });
+        return res;
+      },
+    };
+
+    const result = await syncFixVerification("fix-1", deps);
+
+    expect(h.patches).toEqual([]);
+    expect(h.getRow()?.status).toBe("fix_pushed");
+    expect(result.commented).toBe(false);
+    expect(result.markedReadyForReview).toBe(false);
+  });
+
+  it("runs test_pushed -> test_failed -> fix_pushed -> verified + PR body update + ready-for-review once", async () => {
+    const initialBody = buildPrBody({
+      output: {
+        title: "Fix off-by-one",
+        explanation: "Use <= instead of <",
+        root_cause: "Boundary check missed the last element",
+        confidence: "high",
+        test: { file_path: "src/foo.test.ts", content: "test()" },
+        changes: [{ file_path: "src/foo.ts", search: "a", replace: "b" }],
+      },
+      errorId: "err-1",
+      baseCommitSha: BASE_SHA,
+      testPath: "src/foo.test.ts",
+      testCommitSha: TEST_SHA,
+      fixCommitSha: FIX_SHA,
+      fixedPaths: ["src/foo.ts"],
+      failingRunUrl: ORIG_RUN,
+    });
+
+    const runsBySha: Record<string, WorkflowRun[]> = {
+      [TEST_SHA]: [run("failure", RED_RUN)],
+    };
+    const h = harness(
+      fixRow({ status: "test_pushed", fix_commit_sha: null, pr_number: null, pr_url: null }),
+      runsBySha,
+      undefined,
+      { prBody: initialBody, prDraft: true },
+    );
+
+    // 1. Test commit fails CI before fix commit is pushed -> test_failed
+    const step1 = await syncFixVerification("fix-1", h.deps);
+    expect(step1).toMatchObject({ status: "test_failed", outcome: "test_reproduced" });
+    expect(h.getRow()?.status).toBe("test_failed");
+
+    // 2. Role 2 pushes fix commit and opens draft PR -> fix_pushed
+    expect(canAdvanceStatus(h.getRow()!.status as FixStatus, "fix_pushed")).toBe(true);
+    h.setRow({
+      ...h.getRow()!,
+      status: "fix_pushed",
+      fix_commit_sha: FIX_SHA,
+      pr_number: 42,
+      pr_url: "https://github.com/octo/demo/pull/42",
+    });
+
+    // Polling again before green run finishes is a no-op DB write.
+    const poll = await syncFixVerification("fix-1", h.deps);
+    expect(poll).toMatchObject({ status: "fix_pushed", outcome: "test_reproduced", commented: false });
+
+    // 3. Fix commit passes CI -> verified, PR body links both runs, marked ready, commented once
+    runsBySha[FIX_SHA] = [run("success", GREEN_RUN)];
+    const step3 = await syncFixVerification("fix-1", h.deps);
+    expect(step3).toMatchObject({
+      status: "verified",
+      outcome: "verified",
+      testRunUrl: RED_RUN,
+      fixRunUrl: GREEN_RUN,
+      commented: true,
+      markedReadyForReview: true,
+    });
+    expect(h.getPrState().draft).toBe(false);
+    expect(h.getPrState().body).toContain(`([red run](${RED_RUN}))`);
+    expect(h.getPrState().body).toContain(`passes ([green run](${GREEN_RUN})).`);
+    expect(h.getPrState().body).not.toContain("it is linked here once verification records it");
+    expect(h.comments).toHaveLength(1);
+    expect(h.comments[0].body).toContain(VERIFICATION_COMMENT_MARKER);
+    expect(h.graphqlCalls).toHaveLength(1);
+
+    // 4. Subsequent webhook or poll is a complete no-op
+    const step4 = await syncFixVerification("fix-1", h.deps);
+    expect(step4).toMatchObject({ status: "verified", commented: false, markedReadyForReview: false });
+    expect(h.comments).toHaveLength(1);
+    expect(h.graphqlCalls).toHaveLength(1);
+    expect(h.prPatches).toHaveLength(1);
+  });
+
+  it("allows only one concurrent winner to comment, update PR body, and mark ready", async () => {
+    const h = harness(
+      fixRow(),
+      { [TEST_SHA]: [run("failure", RED_RUN)], [FIX_SHA]: [run("success", GREEN_RUN)] },
+      undefined,
+      { prBody: "", prDraft: true },
+    );
+
+    const [first, second] = await Promise.all([
+      syncFixVerification("fix-1", h.deps),
+      syncFixVerification("fix-1", h.deps),
+    ]);
+
+    const outcomes = [first, second];
+    expect(outcomes.filter((r) => r.commented)).toHaveLength(1);
+    expect(outcomes.filter((r) => !r.commented)).toHaveLength(1);
+    expect(outcomes.filter((r) => r.markedReadyForReview)).toHaveLength(1);
+    expect(h.comments).toHaveLength(1);
+    expect(h.graphqlCalls).toHaveLength(1);
+    expect(h.prPatches).toHaveLength(1);
   });
 
   it("does not comment or mark ready when another run settled the fix first", async () => {
@@ -510,6 +747,175 @@ describe("settling a fix exactly once", () => {
   });
 });
 
+describe("retry-safe GitHub ordering and rollback", () => {
+  it("rolls back status when markReadyForReview fails so a retry completes without duplicate PR edits or comments", async () => {
+    let failGraphql = true;
+    const h = harness(
+      fixRow(),
+      { [TEST_SHA]: [run("failure", RED_RUN)], [FIX_SHA]: [run("success", GREEN_RUN)] },
+      undefined,
+      {
+        prBody:
+          "- **Red run:** ... (it is linked here once verification records it).\n- **Fix:** passes (green run).",
+        prDraft: true,
+        failOn: (op) => (op === "GRAPHQL" && failGraphql ? new Error("GitHub 502") : null),
+      },
+    );
+
+    await expect(syncFixVerification("fix-1", h.deps)).rejects.toThrow("GitHub 502");
+    // DB reverted back to fix_pushed; no premature "marking ready for review" comment posted.
+    expect(h.getRow()?.status).toBe("fix_pushed");
+    expect(h.comments).toEqual([]);
+    expect(h.prPatches).toHaveLength(1);
+
+    failGraphql = false;
+    const retried = await syncFixVerification("fix-1", h.deps);
+    expect(retried).toMatchObject({
+      status: "verified",
+      commented: true,
+      markedReadyForReview: true,
+    });
+    expect(h.getRow()?.status).toBe("verified");
+    expect(h.prPatches).toHaveLength(1);
+    expect(h.graphqlCalls).toHaveLength(1);
+    expect(h.comments).toHaveLength(1);
+  });
+
+  it("rolls back status when postPrComment fails and skips ready mutation on retry", async () => {
+    let failComment = true;
+    const h = harness(
+      fixRow(),
+      { [TEST_SHA]: [run("failure", RED_RUN)], [FIX_SHA]: [run("success", GREEN_RUN)] },
+      undefined,
+      {
+        prBody: "- **Fix:** passes (green run).",
+        prDraft: true,
+        failOn: (op) =>
+          op.startsWith("POST") && op.endsWith("/comments") && failComment
+            ? new Error("GitHub comment 500")
+            : null,
+      },
+    );
+
+    await expect(syncFixVerification("fix-1", h.deps)).rejects.toThrow("GitHub comment 500");
+    expect(h.getRow()?.status).toBe("fix_pushed");
+    expect(h.getPrState().draft).toBe(false);
+    expect(h.graphqlCalls).toHaveLength(1);
+    expect(h.comments).toEqual([]);
+
+    failComment = false;
+    const retried = await syncFixVerification("fix-1", h.deps);
+    expect(retried).toMatchObject({ status: "verified", commented: true, markedReadyForReview: true });
+    expect(h.getRow()?.status).toBe("verified");
+    expect(h.graphqlCalls).toHaveLength(1);
+    expect(h.prPatches).toHaveLength(1);
+    expect(h.comments).toHaveLength(1);
+  });
+
+  it("skips posting a duplicate comment if a comment with the verification marker already exists", async () => {
+    const h = harness(
+      fixRow(),
+      { [TEST_SHA]: [run("failure", RED_RUN)], [FIX_SHA]: [run("success", GREEN_RUN)] },
+      undefined,
+      {
+        prBody: "",
+        prDraft: true,
+        existingComments: [`Prior verification\n\n${VERIFICATION_COMMENT_MARKER}`],
+      },
+    );
+
+    await syncFixVerification("fix-1", h.deps);
+
+    expect(h.comments).toHaveLength(1);
+    expect(h.routes).not.toContain("POST /repos/{owner}/{repo}/issues/{issue_number}/comments");
+  });
+});
+
+describe("buildUpdatedPrBody", () => {
+  it("fills Role 2 placeholders on two-commit PRs cleanly and idempotently", () => {
+    const initial = buildPrBody({
+      output: {
+        title: "Fix bug",
+        explanation: "Fix",
+        root_cause: "Root",
+        confidence: "high",
+        test: { file_path: "a.test.ts", content: "t" },
+        changes: [{ file_path: "a.ts", search: "x", replace: "y" }],
+      },
+      errorId: "err-1",
+      baseCommitSha: BASE_SHA,
+      testPath: "a.test.ts",
+      testCommitSha: TEST_SHA,
+      fixCommitSha: FIX_SHA,
+      fixedPaths: ["a.ts"],
+      failingRunUrl: ORIG_RUN,
+    });
+
+    const once = buildUpdatedPrBody(initial, {
+      outcome: "verified",
+      testRunUrl: RED_RUN,
+      fixRunUrl: GREEN_RUN,
+    });
+    expect(once).toContain(`([red run](${RED_RUN}))`);
+    expect(once).toContain(`passes ([green run](${GREEN_RUN})).`);
+    expect(once).not.toContain("<!-- fixtee:verification -->");
+
+    const twice = buildUpdatedPrBody(once, {
+      outcome: "verified",
+      testRunUrl: RED_RUN,
+      fixRunUrl: GREEN_RUN,
+    });
+    expect(twice).toBe(once);
+  });
+
+  it("updates existing-test single-commit PR body cleanly", () => {
+    const initial = buildPrBody({
+      output: {
+        title: "Fix bug",
+        explanation: "Fix",
+        root_cause: "Root",
+        confidence: "high",
+        test: { file_path: "a.test.ts", content: "t" },
+        changes: [{ file_path: "a.ts", search: "x", replace: "y" }],
+      },
+      errorId: "err-1",
+      baseCommitSha: BASE_SHA,
+      testPath: "a.test.ts",
+      testCommitSha: null,
+      fixCommitSha: FIX_SHA,
+      fixedPaths: ["a.ts"],
+      failingRunUrl: ORIG_RUN,
+    });
+
+    const updated = buildUpdatedPrBody(initial, {
+      outcome: "verified",
+      testRunUrl: ORIG_RUN,
+      fixRunUrl: GREEN_RUN,
+    });
+    expect(updated).toContain(ORIG_RUN);
+    expect(updated).toContain(`passes ([green run](${GREEN_RUN})).`);
+    expect(updated).not.toContain("<!-- fixtee:verification -->");
+  });
+
+  it("upserts a bounded verification block for failed outcomes", () => {
+    const first = buildUpdatedPrBody("Custom body", {
+      outcome: "fix_failed_ci",
+      testRunUrl: RED_RUN,
+      fixRunUrl: GREEN_RUN,
+    });
+    expect(first).toContain("<!-- fixtee:verification -->");
+    expect(first).toContain("CI still fails on the fix commit");
+
+    const second = buildUpdatedPrBody(first, {
+      outcome: "guardrail_test_passed",
+      testRunUrl: RED_RUN,
+      fixRunUrl: null,
+    });
+    expect(second.match(/<!-- fixtee:verification -->/g)).toHaveLength(1);
+    expect(second).toContain("reproduction test passed without the fix");
+  });
+});
+
 describe("webhook run hint", () => {
   it("uses the hint when GitHub has not listed the run yet", async () => {
     const h = harness(fixRow(), { [TEST_SHA]: [run("failure", RED_RUN)] });
@@ -531,6 +937,24 @@ describe("webhook run hint", () => {
     ]);
   });
 
+  it("treats timed_out, startup_failure, and action_required hints as failure instead of pending", async () => {
+    for (const conclusion of ["timed_out", "startup_failure", "action_required"]) {
+      const h = harness(fixRow(), { [TEST_SHA]: [run("failure", RED_RUN)] });
+      const result = await syncFixVerification("fix-1", h.deps, {
+        headSha: FIX_SHA,
+        conclusion,
+        runUrl: GREEN_RUN,
+      });
+      expect(result).toMatchObject({
+        status: "failed",
+        outcome: "fix_failed_ci",
+        fixRunUrl: GREEN_RUN,
+        commented: true,
+        markedReadyForReview: false,
+      });
+    }
+  });
+
   it("prefers what GitHub reports over the hint", async () => {
     const h = harness(fixRow(), {
       [TEST_SHA]: [run("failure", RED_RUN)],
@@ -549,7 +973,7 @@ describe("webhook run hint", () => {
   it("ignores a hint for a different commit, or one with no usable conclusion", async () => {
     const other = harness(fixRow(), { [TEST_SHA]: [run("failure", RED_RUN)] });
     const ignored = await syncFixVerification("fix-1", other.deps, {
-      headSha: "ccccccc3333333333333333333333333333333333",
+      headSha: BASE_SHA,
       conclusion: "success",
       runUrl: GREEN_RUN,
     });
@@ -582,15 +1006,36 @@ describe("webhook run hint", () => {
   });
 });
 
-describe("normalizeConclusion", () => {
-  it("accepts only the two conclusions the state machine acts on", () => {
+describe("normalizeConclusion and pickRun failure states", () => {
+  it("maps success and failure-equivalent CI conclusions and treats non-terminal conclusions as null", () => {
     expect(normalizeConclusion("success")).toBe("success");
     expect(normalizeConclusion("failure")).toBe("failure");
+    expect(normalizeConclusion("timed_out")).toBe("failure");
+    expect(normalizeConclusion("startup_failure")).toBe("failure");
+    expect(normalizeConclusion("action_required")).toBe("failure");
     expect(normalizeConclusion("cancelled")).toBeNull();
-    expect(normalizeConclusion("timed_out")).toBeNull();
+    expect(normalizeConclusion("skipped")).toBeNull();
+    expect(normalizeConclusion("neutral")).toBeNull();
     expect(normalizeConclusion(null)).toBeNull();
     expect(normalizeConclusion(undefined)).toBeNull();
   });
+
+  it.each(["timed_out", "startup_failure", "action_required"])(
+    "pickRun treats %s as a failure state and settles instead of leaving pending",
+    async (conclusion) => {
+      expect(pickRun([run("success", GREEN_RUN), run(conclusion, RED_RUN)])).toEqual({
+        conclusion: "failure",
+        runUrl: RED_RUN,
+      });
+
+      const h = harness(fixRow(), {
+        [TEST_SHA]: [run("failure", RED_RUN)],
+        [FIX_SHA]: [run(conclusion, GREEN_RUN)],
+      });
+      const result = await syncFixVerification("fix-1", h.deps);
+      expect(result).toMatchObject({ status: "failed", outcome: "fix_failed_ci", commented: true });
+    },
+  );
 });
 
 describe("verifyFixByBranch", () => {
@@ -751,9 +1196,13 @@ const verifiedResult: VerificationResult = {
   markedReadyForReview: true,
 };
 
-function routeHarness(user: { id: string } | null, visible: boolean) {
+function routeHarness(
+  user: { id: string } | null,
+  visible: boolean,
+  branchResult: VerificationResult | null = verifiedResult,
+) {
   const queried: string[] = [];
-  const syncCalls: string[] = [];
+  const syncCalls: { fixId: string; hint?: RunHint }[] = [];
   const branchCalls: unknown[] = [];
 
   const supabase = {
@@ -776,13 +1225,13 @@ function routeHarness(user: { id: string } | null, visible: boolean) {
     branchCalls,
     deps: {
       getUserClient: async () => supabase,
-      syncFix: async (fixId: string) => {
-        syncCalls.push(fixId);
+      syncFix: async (fixId: string, hint?: RunHint) => {
+        syncCalls.push(hint ? { fixId, hint } : { fixId });
         return verifiedResult;
       },
       verifyBranch: async (ref: unknown) => {
         branchCalls.push(ref);
-        return verifiedResult;
+        return branchResult;
       },
     },
   };
@@ -814,7 +1263,29 @@ describe("POST /api/verify", () => {
       fixRunUrl: GREEN_RUN,
     });
     expect(h.queried).toEqual(["fixes"]);
-    expect(h.syncCalls).toEqual([FIX_UUID]);
+    expect(h.syncCalls).toEqual([{ fixId: FIX_UUID }]);
+  });
+
+  it("forwards an optional run hint when verifying by fixId", async () => {
+    const h = routeHarness({ id: "user-1" }, true);
+
+    const response = await handleVerifyRequest(
+      h.deps,
+      jsonBody({
+        fixId: FIX_UUID,
+        headSha: FIX_SHA,
+        conclusion: "success",
+        runUrl: GREEN_RUN,
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(h.syncCalls).toEqual([
+      {
+        fixId: FIX_UUID,
+        hint: { headSha: FIX_SHA, conclusion: "success", runUrl: GREEN_RUN },
+      },
+    ]);
   });
 
   it("hides a fix belonging to someone else behind a 404", async () => {
@@ -851,6 +1322,20 @@ describe("POST /api/verify", () => {
         runUrl: GREEN_RUN,
       },
     ]);
+  });
+
+  it("answers 404 when no fix awaits verification on the branch", async () => {
+    const h = routeHarness({ id: "user-1" }, true, null);
+
+    const response = await handleVerifyRequest(
+      h.deps,
+      jsonBody({ projectId: PROJECT_UUID, branchName: "autofix/already-settled" }),
+    );
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({
+      message: "no fix awaiting verification for this branch",
+    });
   });
 
   it("hides a project belonging to someone else behind a 404", async () => {

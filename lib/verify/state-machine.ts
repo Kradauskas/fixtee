@@ -1,9 +1,22 @@
 import { z } from "zod";
+import {
+  NON_TERMINAL_STATUSES,
+  SETTLED_STATUSES,
+  STATUS_ORDER,
+  type FixStatus,
+} from "../db/fix-status";
 import { getServiceClient, type Db } from "../db/supabase";
-import { Constants, type Tables, type TablesUpdate } from "../db/types";
+import { type TablesUpdate } from "../db/types";
 import { getInstallationOctokit } from "../github/app";
 
-export type FixStatus = Tables<"fixes">["status"];
+export { NON_TERMINAL_STATUSES, SETTLED_STATUSES, STATUS_ORDER, type FixStatus };
+
+export const VERIFICATION_COMMENT_MARKER = "<!-- fixtee:verification -->";
+const PR_BODY_BLOCK_START = "<!-- fixtee:verification -->";
+const PR_BODY_BLOCK_END = "<!-- /fixtee:verification -->";
+const RED_RUN_PLACEHOLDER = "(it is linked here once verification records it)";
+const GREEN_RUN_PLACEHOLDER = "passes (green run).";
+const EXISTING_RED_UNAVAILABLE = "- **Red run (existing test failing):** _(run URL not available)_";
 
 export type CiConclusion = "success" | "failure" | null;
 
@@ -61,33 +74,58 @@ export type RunHint = {
 
 export type FixBranchRef = { projectId: string; branchName: string } & RunHint;
 
+export type PrBodyUpdate = {
+  outcome: VerificationOutcome;
+  testRunUrl: string | null;
+  fixRunUrl: string | null;
+};
+
 export type VerifyDeps = {
   loadFix(fixId: string): Promise<FixVerificationContext | null>;
   findFixIdByBranch(projectId: string, branchName: string): Promise<string | null>;
   saveStatus(fixId: string, status: FixStatus, runUrls: FixRunUrls): Promise<boolean>;
+  revertStatus?(fixId: string, fromStatus: FixStatus, toStatus: FixStatus): Promise<void>;
+  updatePrBody?(fix: FixVerificationContext, info: PrBodyUpdate): Promise<void>;
   postPrComment(fix: FixVerificationContext, body: string): Promise<void>;
   markReadyForReview(fix: FixVerificationContext): Promise<void>;
   findCompletedRun(fix: FixVerificationContext, sha: string): Promise<CiRun>;
   log(message: string, details?: Record<string, unknown>): void;
 };
 
-const STATUS_BY_OUTCOME: Record<VerificationOutcome, FixStatus | null> = {
+type StatusResolver = FixStatus | ((fix: Pick<FixVerificationContext, "fixCommitSha">) => FixStatus);
+
+export const STATUS_BY_OUTCOME: Record<VerificationOutcome, StatusResolver | null> = {
   pending: null,
-  test_reproduced: "fix_pushed",
+  test_reproduced: (fix) => (fix.fixCommitSha === null ? "test_failed" : "fix_pushed"),
   guardrail_test_passed: "failed",
   fix_failed_ci: "failed",
   verified: "verified",
 };
 
-const SETTLED_STATUSES: ReadonlySet<FixStatus> = new Set<FixStatus>(["verified", "failed"]);
+const FAILURE_CONCLUSIONS: ReadonlySet<string> = new Set([
+  "failure",
+  "timed_out",
+  "startup_failure",
+  "action_required",
+]);
 
-export const NON_TERMINAL_STATUSES: FixStatus[] = Constants.public.Enums.fix_status.filter(
-  (status) => !SETTLED_STATUSES.has(status),
-);
+function resolveTargetStatus(
+  outcome: VerificationOutcome,
+  fix: Pick<FixVerificationContext, "fixCommitSha">,
+): FixStatus | null {
+  const entry = STATUS_BY_OUTCOME[outcome];
+  return typeof entry === "function" ? entry(fix) : entry;
+}
+
+export function allowedSourceStatuses(target: FixStatus): FixStatus[] {
+  if (SETTLED_STATUSES.has(target)) return NON_TERMINAL_STATUSES;
+  const index = STATUS_ORDER.indexOf(target);
+  return index === -1 ? [] : STATUS_ORDER.slice(0, index + 1);
+}
 
 export function normalizeConclusion(value: string | null | undefined): CiConclusion {
   if (value === "success") return "success";
-  if (value === "failure") return "failure";
+  if (value && FAILURE_CONCLUSIONS.has(value)) return "failure";
   return null;
 }
 
@@ -111,6 +149,87 @@ export function decideOutcome(
   return "test_reproduced";
 }
 
+function upsertVerificationBlock(body: string, block: string): string {
+  const start = PR_BODY_BLOCK_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const end = PR_BODY_BLOCK_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`${start}[\\s\\S]*?${end}`);
+  if (pattern.test(body)) return body.replace(pattern, block);
+  const trimmed = body.trimEnd();
+  return trimmed.length > 0 ? `${trimmed}\n\n${block}` : block;
+}
+
+function buildVerificationBlock(info: PrBodyUpdate): string {
+  const lines = [PR_BODY_BLOCK_START, "### Verification"];
+  switch (info.outcome) {
+    case "verified":
+      lines.push("- **Status:** Verified (test fails before the fix and passes after it)");
+      if (info.testRunUrl) lines.push(`- **Red run:** [failed as expected](${info.testRunUrl})`);
+      if (info.fixRunUrl) lines.push(`- **Green run:** [passed](${info.fixRunUrl})`);
+      break;
+    case "guardrail_test_passed":
+      lines.push("- **Status:** Failed — reproduction test passed without the fix (PR kept as draft)");
+      if (info.testRunUrl) lines.push(`- **Test run:** [passed without the fix](${info.testRunUrl})`);
+      break;
+    case "fix_failed_ci":
+      lines.push("- **Status:** Failed — CI still fails on the fix commit (PR kept as draft)");
+      if (info.testRunUrl) lines.push(`- **Red run:** [failed as expected](${info.testRunUrl})`);
+      if (info.fixRunUrl) lines.push(`- **Fix run:** [still fails in CI](${info.fixRunUrl})`);
+      break;
+    case "test_reproduced":
+      lines.push("- **Status:** Red run reproduced — awaiting fix commit CI");
+      if (info.testRunUrl) lines.push(`- **Red run:** [failed as expected](${info.testRunUrl})`);
+      break;
+    default:
+      break;
+  }
+  lines.push(PR_BODY_BLOCK_END);
+  return lines.join("\n");
+}
+
+export function buildUpdatedPrBody(body: string, info: PrBodyUpdate): string {
+  let updated = body;
+
+  if (info.testRunUrl) {
+    const redReplacement =
+      info.outcome === "guardrail_test_passed"
+        ? `([passed without the fix](${info.testRunUrl}))`
+        : `([red run](${info.testRunUrl}))`;
+    updated = updated.replace(RED_RUN_PLACEHOLDER, redReplacement);
+
+    if (info.outcome !== "guardrail_test_passed" && updated.includes(EXISTING_RED_UNAVAILABLE)) {
+      updated = updated.replace(
+        EXISTING_RED_UNAVAILABLE,
+        `- **Red run (existing test failing):** [red run](${info.testRunUrl})`,
+      );
+    }
+  }
+
+  if (info.fixRunUrl && info.outcome === "verified") {
+    updated = updated.replace(GREEN_RUN_PLACEHOLDER, `passes ([green run](${info.fixRunUrl})).`);
+  }
+
+  const hasBlock = updated.includes(PR_BODY_BLOCK_START) && updated.includes(PR_BODY_BLOCK_END);
+
+  if (info.outcome === "verified") {
+    const redLinked = !info.testRunUrl || updated.includes(info.testRunUrl);
+    const greenLinked = !info.fixRunUrl || updated.includes(info.fixRunUrl);
+    if (redLinked && greenLinked && !hasBlock) return updated;
+    return upsertVerificationBlock(updated, buildVerificationBlock(info));
+  }
+
+  if (info.outcome === "test_reproduced") {
+    const redLinked = !info.testRunUrl || updated.includes(info.testRunUrl);
+    if (redLinked && !hasBlock) return updated;
+    return upsertVerificationBlock(updated, buildVerificationBlock(info));
+  }
+
+  if (info.outcome === "guardrail_test_passed" || info.outcome === "fix_failed_ci") {
+    return upsertVerificationBlock(updated, buildVerificationBlock(info));
+  }
+
+  return updated;
+}
+
 export async function handleAgentCiResult(
   { fixId, testConclusion, fixConclusion, testRunUrl = null, fixRunUrl = null }: AgentCiResult,
   deps: VerifyDeps = createVerifyDeps(),
@@ -120,7 +239,10 @@ export async function handleAgentCiResult(
 
   const reusesExistingTest = fix.testCommitSha === null && fix.fixCommitSha !== null;
   const effectiveTestConclusion: CiConclusion = reusesExistingTest ? "failure" : testConclusion;
-  const effectiveTestRunUrl = reusesExistingTest ? (testRunUrl ?? fix.redRunUrl) : testRunUrl;
+  const effectiveTestRunUrl =
+    reusesExistingTest || effectiveTestConclusion === "failure"
+      ? (testRunUrl ?? fix.redRunUrl)
+      : testRunUrl;
 
   const outcome = decideOutcome(effectiveTestConclusion, fixConclusion);
   const noChange = (status: FixStatus): VerificationResult => ({
@@ -132,8 +254,8 @@ export async function handleAgentCiResult(
     markedReadyForReview: false,
   });
 
-  const target = STATUS_BY_OUTCOME[outcome];
-  if (target === null) {
+  const rawTarget = resolveTargetStatus(outcome, fix);
+  if (rawTarget === null) {
     deps.log("verify: CI result is not conclusive yet", {
       fix: fixId,
       test: effectiveTestConclusion,
@@ -146,6 +268,13 @@ export async function handleAgentCiResult(
     return noChange(fix.status);
   }
 
+  const currentOrder = STATUS_ORDER.indexOf(fix.status);
+  const targetOrder = STATUS_ORDER.indexOf(rawTarget);
+  const target: FixStatus =
+    !SETTLED_STATUSES.has(rawTarget) && targetOrder !== -1 && currentOrder > targetOrder
+      ? fix.status
+      : rawTarget;
+
   const runUrls: FixRunUrls = {};
   if (effectiveTestRunUrl && effectiveTestRunUrl !== fix.redRunUrl) {
     runUrls.redRunUrl = effectiveTestRunUrl;
@@ -155,10 +284,11 @@ export async function handleAgentCiResult(
   }
 
   const recordsNewUrl = runUrls.redRunUrl !== undefined || runUrls.greenRunUrl !== undefined;
+  let wroteStatus = false;
   if (target !== fix.status || recordsNewUrl) {
     const saved = await deps.saveStatus(fixId, target, runUrls);
     if (!saved) {
-      deps.log("verify: another run settled this fix first", {
+      deps.log("verify: another run already advanced or settled this fix", {
         fix: fixId,
         outcome,
         status: target,
@@ -172,6 +302,7 @@ export async function handleAgentCiResult(
         markedReadyForReview: false,
       };
     }
+    wroteStatus = target !== fix.status;
   }
 
   const body = buildComment(outcome, fix, effectiveTestRunUrl, fixRunUrl);
@@ -180,11 +311,38 @@ export async function handleAgentCiResult(
     deps.log("verify: no pull request recorded, skipping comment", { fix: fixId, outcome });
   }
 
+  const shouldUpdatePrBody =
+    hasPr && (SETTLED_STATUSES.has(target) || runUrls.redRunUrl !== undefined);
   const commented = Boolean(body) && hasPr;
-  if (body && hasPr) await deps.postPrComment(fix, body);
-
   const markedReadyForReview = outcome === "verified" && hasPr;
-  if (markedReadyForReview) await deps.markReadyForReview(fix);
+
+  // Claim status atomically first, perform idempotent GitHub writes, and roll back non-terminal
+  // source status on failure so transient GitHub errors never lock out retries.
+  try {
+    if (shouldUpdatePrBody) {
+      await deps.updatePrBody?.(fix, {
+        outcome,
+        testRunUrl: effectiveTestRunUrl,
+        fixRunUrl,
+      });
+    }
+    if (markedReadyForReview) await deps.markReadyForReview(fix);
+    if (body && hasPr) await deps.postPrComment(fix, body);
+  } catch (err) {
+    if (wroteStatus) {
+      try {
+        await deps.revertStatus?.(fixId, target, fix.status);
+      } catch (revertErr) {
+        deps.log("verify: failed to revert status after GitHub error", {
+          fix: fixId,
+          target,
+          previous: fix.status,
+          error: revertErr instanceof Error ? revertErr.message : String(revertErr),
+        });
+      }
+    }
+    throw err;
+  }
 
   deps.log("verify: fix updated", {
     fix: fixId,
@@ -305,6 +463,8 @@ export function buildComment(
         `Agent confidence: ${formatConfidence(fix.confidence)}.`,
         "",
         "Marking this pull request ready for review.",
+        "",
+        VERIFICATION_COMMENT_MARKER,
       ].join("\n");
 
     case "guardrail_test_passed":
@@ -316,6 +476,8 @@ export function buildComment(
         "A test that already passes before the fix does not reproduce the reported bug, so nothing here shows the change is needed or that it works.",
         "",
         "This pull request stays a draft for a human to look at.",
+        "",
+        VERIFICATION_COMMENT_MARKER,
       ].join("\n");
 
     case "fix_failed_ci":
@@ -330,6 +492,8 @@ export function buildComment(
         "The change does not make the failing test pass. This pull request stays a draft for a human to look at.",
         "",
         `Agent confidence: ${formatConfidence(fix.confidence)}.`,
+        "",
+        VERIFICATION_COMMENT_MARKER,
       ].join("\n");
 
     default:
@@ -356,7 +520,17 @@ const workflowRunsSchema = z.object({
   ),
 });
 
-const pullRequestSchema = z.object({ node_id: z.string() });
+const pullRequestSchema = z.object({
+  node_id: z.string(),
+  draft: z.boolean().optional(),
+  body: z.string().nullable().optional(),
+});
+
+const issueCommentsSchema = z.array(
+  z.object({
+    body: z.string().nullable().optional(),
+  }),
+);
 
 function embedded<T extends z.ZodTypeAny>(schema: T) {
   return z.union([
@@ -402,10 +576,10 @@ const READY_FOR_REVIEW_MUTATION = `
 `;
 
 export function pickRun(runs: { conclusion: string | null; html_url: string }[]): CiRun {
-  const failed = runs.find((run) => run.conclusion === "failure");
+  const failed = runs.find((run) => normalizeConclusion(run.conclusion) === "failure");
   if (failed) return { conclusion: "failure", runUrl: failed.html_url };
 
-  const passed = runs.find((run) => run.conclusion === "success");
+  const passed = runs.find((run) => normalizeConclusion(run.conclusion) === "success");
   if (passed) return { conclusion: "success", runUrl: passed.html_url };
 
   return { conclusion: null, runUrl: runs[0]?.html_url ?? null };
@@ -474,28 +648,78 @@ export function createVerifyDeps(options: VerifyDepsOptions = {}): VerifyDeps {
     },
 
     async saveStatus(fixId, status, runUrls) {
+      const allowed = allowedSourceStatuses(status);
+      if (allowed.length === 0) return false;
+
       const patch: TablesUpdate<"fixes"> = { status };
       if (runUrls.redRunUrl) patch.red_run_url = runUrls.redRunUrl;
       if (runUrls.greenRunUrl) patch.green_run_url = runUrls.greenRunUrl;
 
-      const update = db.from("fixes").update(patch).eq("id", fixId);
-      const guarded = SETTLED_STATUSES.has(status)
-        ? update.in("status", NON_TERMINAL_STATUSES)
-        : update;
-
-      const { data, error } = await guarded.select("id");
+      const { data, error } = await db
+        .from("fixes")
+        .update(patch)
+        .eq("id", fixId)
+        .in("status", allowed)
+        .select("id");
       if (error) throw new Error(`verify: updating fix ${fixId} failed: ${error.message}`);
       return data.length > 0;
+    },
+
+    async revertStatus(fixId, fromStatus, toStatus) {
+      const { error } = await db
+        .from("fixes")
+        .update({ status: toStatus })
+        .eq("id", fixId)
+        .eq("status", fromStatus)
+        .select("id");
+      if (error) throw new Error(`verify: reverting fix ${fixId} failed: ${error.message}`);
+    },
+
+    async updatePrBody(fix, info) {
+      if (fix.prNumber === null) return;
+      const client = await getClient(fix.installationId);
+      const pull = await client.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
+        owner: fix.owner,
+        repo: fix.repo,
+        pull_number: fix.prNumber,
+      });
+      const { body } = pullRequestSchema.parse(pull.data);
+      if (body === undefined) return;
+      const currentBody = body ?? "";
+      const nextBody = buildUpdatedPrBody(currentBody, info);
+      if (nextBody === currentBody) return;
+      await client.request("PATCH /repos/{owner}/{repo}/pulls/{pull_number}", {
+        owner: fix.owner,
+        repo: fix.repo,
+        pull_number: fix.prNumber,
+        body: nextBody,
+      });
     },
 
     async postPrComment(fix, body) {
       if (fix.prNumber === null) return;
       const client = await getClient(fix.installationId);
+      const existing = await client.request(
+        "GET /repos/{owner}/{repo}/issues/{issue_number}/comments",
+        {
+          owner: fix.owner,
+          repo: fix.repo,
+          issue_number: fix.prNumber,
+          per_page: 100,
+        },
+      );
+      const existingComments = issueCommentsSchema.parse(existing.data);
+      if (existingComments.some((comment) => comment.body?.includes(VERIFICATION_COMMENT_MARKER))) {
+        return;
+      }
+      const markedBody = body.includes(VERIFICATION_COMMENT_MARKER)
+        ? body
+        : `${body}\n\n${VERIFICATION_COMMENT_MARKER}`;
       await client.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
         owner: fix.owner,
         repo: fix.repo,
         issue_number: fix.prNumber,
-        body,
+        body: markedBody,
       });
     },
 
@@ -507,7 +731,8 @@ export function createVerifyDeps(options: VerifyDepsOptions = {}): VerifyDeps {
         repo: fix.repo,
         pull_number: fix.prNumber,
       });
-      const { node_id } = pullRequestSchema.parse(pull.data);
+      const { node_id, draft } = pullRequestSchema.parse(pull.data);
+      if (draft === false) return;
       await client.graphql(READY_FOR_REVIEW_MUTATION, { pullRequestId: node_id });
     },
 
