@@ -8,13 +8,15 @@ import { buildPrBody } from "../agent/github";
 import type { Db } from "../db/supabase";
 import {
   allowedSourceStatuses,
-  buildUpdatedPrBody,
+  buildUpdatedPrDescription,
   createVerifyDeps,
   decideOutcome,
   handleAgentCiResult,
   NON_TERMINAL_STATUSES,
   normalizeConclusion,
   pickRun,
+  PR_DESCRIPTION_MARKER_END,
+  PR_DESCRIPTION_MARKER_START,
   syncFixVerification,
   VERIFICATION_COMMENT_MARKER,
   verifyFixByBranch,
@@ -677,6 +679,11 @@ describe("settling a fix exactly once", () => {
     expect(h.getPrState().body).toContain(`([red run](${RED_RUN}))`);
     expect(h.getPrState().body).toContain(`passes ([green run](${GREEN_RUN})).`);
     expect(h.getPrState().body).not.toContain("it is linked here once verification records it");
+    expect(h.getPrState().body).toContain(PR_DESCRIPTION_MARKER_START);
+    expect(h.getPrState().body).toContain(PR_DESCRIPTION_MARKER_END);
+    expect(h.getPrState().body).toContain("🟢 Verified (`verified`)");
+    expect(h.getPrState().body).toContain(`commit \`${TEST_SHA.slice(0, 7)}\``);
+    expect(h.getPrState().body).toContain(`commit \`${FIX_SHA.slice(0, 7)}\``);
     expect(h.comments).toHaveLength(1);
     expect(h.comments[0].body).toContain(VERIFICATION_COMMENT_MARKER);
     expect(h.graphqlCalls).toHaveLength(1);
@@ -829,10 +836,39 @@ describe("retry-safe GitHub ordering and rollback", () => {
     expect(h.comments).toHaveLength(1);
     expect(h.routes).not.toContain("POST /repos/{owner}/{repo}/issues/{issue_number}/comments");
   });
+
+  it("rolls back status when PATCH /pulls fails in updatePrDescription before ready or comment runs", async () => {
+    let failPatch = true;
+    const h = harness(
+      fixRow(),
+      { [TEST_SHA]: [run("failure", RED_RUN)], [FIX_SHA]: [run("success", GREEN_RUN)] },
+      undefined,
+      {
+        prBody:
+          "- **Red run:** ... (it is linked here once verification records it).\n- **Fix:** passes (green run).",
+        prDraft: true,
+        failOn: (op) => (op.startsWith("PATCH") && failPatch ? new Error("GitHub PR patch 502") : null),
+      },
+    );
+
+    await expect(syncFixVerification("fix-1", h.deps)).rejects.toThrow("GitHub PR patch 502");
+    expect(h.getRow()?.status).toBe("fix_pushed");
+    expect(h.graphqlCalls).toEqual([]);
+    expect(h.comments).toEqual([]);
+
+    failPatch = false;
+    const retried = await syncFixVerification("fix-1", h.deps);
+    expect(retried).toMatchObject({ status: "verified", commented: true, markedReadyForReview: true });
+    expect(h.getPrState().body).toContain(PR_DESCRIPTION_MARKER_START);
+    expect(h.prPatches).toHaveLength(1);
+    expect(h.comments).toHaveLength(1);
+  });
 });
 
-describe("buildUpdatedPrBody", () => {
-  it("fills Role 2 placeholders on two-commit PRs cleanly and idempotently", () => {
+describe("buildUpdatedPrDescription", () => {
+  const twoCommitFix = { testCommitSha: TEST_SHA, fixCommitSha: FIX_SHA };
+
+  it("replaces Role 2 placeholders and appends <!-- fixtee-verification --> with links, SHAs, and status idempotently", () => {
     const initial = buildPrBody({
       output: {
         title: "Fix bug",
@@ -851,24 +887,32 @@ describe("buildUpdatedPrBody", () => {
       failingRunUrl: ORIG_RUN,
     });
 
-    const once = buildUpdatedPrBody(initial, {
+    const once = buildUpdatedPrDescription(initial, twoCommitFix, {
       outcome: "verified",
+      status: "verified",
       testRunUrl: RED_RUN,
       fixRunUrl: GREEN_RUN,
     });
     expect(once).toContain(`([red run](${RED_RUN}))`);
     expect(once).toContain(`passes ([green run](${GREEN_RUN})).`);
-    expect(once).not.toContain("<!-- fixtee:verification -->");
+    expect(once).not.toContain("it is linked here once verification records it");
+    expect(once).toContain(PR_DESCRIPTION_MARKER_START);
+    expect(once).toContain(PR_DESCRIPTION_MARKER_END);
+    expect(once).toContain("🟢 Verified (`verified`)");
+    expect(once).toContain(`[failed as expected](${RED_RUN}) (commit \`${TEST_SHA.slice(0, 7)}\`)`);
+    expect(once).toContain(`[passed](${GREEN_RUN}) (commit \`${FIX_SHA.slice(0, 7)}\`)`);
 
-    const twice = buildUpdatedPrBody(once, {
+    const twice = buildUpdatedPrDescription(once, twoCommitFix, {
       outcome: "verified",
+      status: "verified",
       testRunUrl: RED_RUN,
       fixRunUrl: GREEN_RUN,
     });
     expect(twice).toBe(once);
+    expect(twice.match(/<!-- fixtee-verification -->/g)).toHaveLength(1);
   });
 
-  it("updates existing-test single-commit PR body cleanly", () => {
+  it("updates existing-test single-commit PR descriptions with existing test red run, green run, SHA, and status", () => {
     const initial = buildPrBody({
       output: {
         title: "Fix bug",
@@ -887,32 +931,102 @@ describe("buildUpdatedPrBody", () => {
       failingRunUrl: ORIG_RUN,
     });
 
-    const updated = buildUpdatedPrBody(initial, {
-      outcome: "verified",
-      testRunUrl: ORIG_RUN,
-      fixRunUrl: GREEN_RUN,
-    });
-    expect(updated).toContain(ORIG_RUN);
+    const updated = buildUpdatedPrDescription(
+      initial,
+      { testCommitSha: null, fixCommitSha: FIX_SHA },
+      {
+        outcome: "verified",
+        status: "verified",
+        testRunUrl: ORIG_RUN,
+        fixRunUrl: GREEN_RUN,
+      },
+    );
     expect(updated).toContain(`passes ([green run](${GREEN_RUN})).`);
-    expect(updated).not.toContain("<!-- fixtee:verification -->");
+    expect(updated).toContain(`[failed as expected](${ORIG_RUN}) (existing test)`);
+    expect(updated).toContain(`[passed](${GREEN_RUN}) (commit \`${FIX_SHA.slice(0, 7)}\`)`);
+    expect(updated).toContain(PR_DESCRIPTION_MARKER_START);
   });
 
-  it("upserts a bounded verification block for failed outcomes", () => {
-    const first = buildUpdatedPrBody("Custom body", {
-      outcome: "fix_failed_ci",
-      testRunUrl: RED_RUN,
-      fixRunUrl: GREEN_RUN,
-    });
-    expect(first).toContain("<!-- fixtee:verification -->");
-    expect(first).toContain("CI still fails on the fix commit");
-
-    const second = buildUpdatedPrBody(first, {
-      outcome: "guardrail_test_passed",
+  it("updates an existing <!-- fixtee-verification --> section in place without duplicating markers", () => {
+    const step1 = buildUpdatedPrDescription("Custom PR description", twoCommitFix, {
+      outcome: "test_reproduced",
+      status: "fix_pushed",
       testRunUrl: RED_RUN,
       fixRunUrl: null,
     });
-    expect(second.match(/<!-- fixtee:verification -->/g)).toHaveLength(1);
-    expect(second).toContain("reproduction test passed without the fix");
+    expect(step1).toContain("🟡 Red CI reproduced (`fix_pushed`)");
+    expect(step1).toContain(`[failed as expected](${RED_RUN})`);
+
+    const step2 = buildUpdatedPrDescription(step1, twoCommitFix, {
+      outcome: "fix_failed_ci",
+      status: "failed",
+      testRunUrl: RED_RUN,
+      fixRunUrl: GREEN_RUN,
+    });
+    expect(step2.match(/<!-- fixtee-verification -->/g)).toHaveLength(1);
+    expect(step2.match(/<!-- \/fixtee-verification -->/g)).toHaveLength(1);
+    expect(step2).toContain("❌ Could not verify (`failed`)");
+    expect(step2).toContain(`[failed in CI](${GREEN_RUN}) (commit \`${FIX_SHA.slice(0, 7)}\`)`);
+    expect(step2).not.toContain("awaiting fix commit CI");
+
+    const step3 = buildUpdatedPrDescription(step2, twoCommitFix, {
+      outcome: "guardrail_test_passed",
+      status: "failed",
+      testRunUrl: RED_RUN,
+      fixRunUrl: null,
+    });
+    expect(step3.match(/<!-- fixtee-verification -->/g)).toHaveLength(1);
+    expect(step3).toContain("reproduction test passed without the fix");
+  });
+
+  it("invokes VerifyDeps.updatePrDescription and skips redundant PATCH when already synced", async () => {
+    const h = harness(
+      fixRow(),
+      { [TEST_SHA]: [run("failure", RED_RUN)], [FIX_SHA]: [run("success", GREEN_RUN)] },
+      undefined,
+      { prBody: "Original PR description", prDraft: true },
+    );
+
+    const customCalls: unknown[] = [];
+    await handleAgentCiResult(
+      {
+        fixId: "fix-1",
+        testConclusion: "failure",
+        fixConclusion: "success",
+        testRunUrl: RED_RUN,
+        fixRunUrl: GREEN_RUN,
+      },
+      {
+        ...h.deps,
+        async updatePrDescription(fix, info) {
+          customCalls.push({ fixId: fix.fixId, info });
+          await h.deps.updatePrDescription!(fix, info);
+        },
+      },
+    );
+
+    expect(customCalls).toEqual([
+      {
+        fixId: "fix-1",
+        info: {
+          outcome: "verified",
+          status: "verified",
+          testRunUrl: RED_RUN,
+          fixRunUrl: GREEN_RUN,
+        },
+      },
+    ]);
+    expect(h.prPatches).toHaveLength(1);
+
+    // Calling updatePrDescription directly with identical inputs sends no second PATCH.
+    const fixCtx = await h.deps.loadFix("fix-1");
+    await h.deps.updatePrDescription!(fixCtx!, {
+      outcome: "verified",
+      status: "verified",
+      testRunUrl: RED_RUN,
+      fixRunUrl: GREEN_RUN,
+    });
+    expect(h.prPatches).toHaveLength(1);
   });
 });
 

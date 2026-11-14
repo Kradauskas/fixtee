@@ -12,8 +12,8 @@ import { getInstallationOctokit } from "../github/app";
 export { NON_TERMINAL_STATUSES, SETTLED_STATUSES, STATUS_ORDER, type FixStatus };
 
 export const VERIFICATION_COMMENT_MARKER = "<!-- fixtee:verification -->";
-const PR_BODY_BLOCK_START = "<!-- fixtee:verification -->";
-const PR_BODY_BLOCK_END = "<!-- /fixtee:verification -->";
+export const PR_DESCRIPTION_MARKER_START = "<!-- fixtee-verification -->";
+export const PR_DESCRIPTION_MARKER_END = "<!-- /fixtee-verification -->";
 const RED_RUN_PLACEHOLDER = "(it is linked here once verification records it)";
 const GREEN_RUN_PLACEHOLDER = "passes (green run).";
 const EXISTING_RED_UNAVAILABLE = "- **Red run (existing test failing):** _(run URL not available)_";
@@ -74,8 +74,9 @@ export type RunHint = {
 
 export type FixBranchRef = { projectId: string; branchName: string } & RunHint;
 
-export type PrBodyUpdate = {
+export type PrDescriptionUpdate = {
   outcome: VerificationOutcome;
+  status: FixStatus;
   testRunUrl: string | null;
   fixRunUrl: string | null;
 };
@@ -85,7 +86,7 @@ export type VerifyDeps = {
   findFixIdByBranch(projectId: string, branchName: string): Promise<string | null>;
   saveStatus(fixId: string, status: FixStatus, runUrls: FixRunUrls): Promise<boolean>;
   revertStatus?(fixId: string, fromStatus: FixStatus, toStatus: FixStatus): Promise<void>;
-  updatePrBody?(fix: FixVerificationContext, info: PrBodyUpdate): Promise<void>;
+  updatePrDescription?(fix: FixVerificationContext, info: PrDescriptionUpdate): Promise<void>;
   postPrComment(fix: FixVerificationContext, body: string): Promise<void>;
   markReadyForReview(fix: FixVerificationContext): Promise<void>;
   findCompletedRun(fix: FixVerificationContext, sha: string): Promise<CiRun>;
@@ -149,44 +150,71 @@ export function decideOutcome(
   return "test_reproduced";
 }
 
-function upsertVerificationBlock(body: string, block: string): string {
-  const start = PR_BODY_BLOCK_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const end = PR_BODY_BLOCK_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`${start}[\\s\\S]*?${end}`);
-  if (pattern.test(body)) return body.replace(pattern, block);
+function upsertVerificationSection(body: string, section: string): string {
+  const start = PR_DESCRIPTION_MARKER_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const end = PR_DESCRIPTION_MARKER_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const closedPattern = new RegExp(`${start}[\\s\\S]*?${end}`);
+  if (closedPattern.test(body)) return body.replace(closedPattern, section);
+  if (body.includes(PR_DESCRIPTION_MARKER_START)) {
+    const before = body.slice(0, body.indexOf(PR_DESCRIPTION_MARKER_START)).trimEnd();
+    return before.length > 0 ? `${before}\n\n${section}` : section;
+  }
   const trimmed = body.trimEnd();
-  return trimmed.length > 0 ? `${trimmed}\n\n${block}` : block;
+  return trimmed.length > 0 ? `${trimmed}\n\n${section}` : section;
 }
 
-function buildVerificationBlock(info: PrBodyUpdate): string {
-  const lines = [PR_BODY_BLOCK_START, "### Verification"];
+function buildVerificationSection(
+  fix: Pick<FixVerificationContext, "testCommitSha" | "fixCommitSha">,
+  info: PrDescriptionUpdate,
+): string {
+  const redCommit = fix.testCommitSha
+    ? `commit \`${shortSha(fix.testCommitSha)}\``
+    : "existing test";
+  const fixCommit = fix.fixCommitSha
+    ? `commit \`${shortSha(fix.fixCommitSha)}\``
+    : "fix commit";
+  const lines = [PR_DESCRIPTION_MARKER_START, "### Verification status"];
+
   switch (info.outcome) {
     case "verified":
-      lines.push("- **Status:** Verified (test fails before the fix and passes after it)");
-      if (info.testRunUrl) lines.push(`- **Red run:** [failed as expected](${info.testRunUrl})`);
-      if (info.fixRunUrl) lines.push(`- **Green run:** [passed](${info.fixRunUrl})`);
+      lines.push(
+        `- **Status:** 🟢 Verified (\`${info.status}\`) — test fails before the fix and passes after it`,
+      );
+      lines.push(`- **Red CI run:** ${runLink("failed as expected", info.testRunUrl)} (${redCommit})`);
+      lines.push(`- **Green CI run:** ${runLink("passed", info.fixRunUrl)} (${fixCommit})`);
       break;
     case "guardrail_test_passed":
-      lines.push("- **Status:** Failed — reproduction test passed without the fix (PR kept as draft)");
-      if (info.testRunUrl) lines.push(`- **Test run:** [passed without the fix](${info.testRunUrl})`);
+      lines.push(
+        `- **Status:** ⚠️ Could not verify (\`${info.status}\`) — reproduction test passed without the fix (PR kept as draft)`,
+      );
+      lines.push(`- **Red CI run:** ${runLink("passed without the fix", info.testRunUrl)} (${redCommit})`);
       break;
     case "fix_failed_ci":
-      lines.push("- **Status:** Failed — CI still fails on the fix commit (PR kept as draft)");
-      if (info.testRunUrl) lines.push(`- **Red run:** [failed as expected](${info.testRunUrl})`);
-      if (info.fixRunUrl) lines.push(`- **Fix run:** [still fails in CI](${info.fixRunUrl})`);
+      lines.push(
+        `- **Status:** ❌ Could not verify (\`${info.status}\`) — CI still fails on the fix commit (PR kept as draft)`,
+      );
+      lines.push(`- **Red CI run:** ${runLink("failed as expected", info.testRunUrl)} (${redCommit})`);
+      lines.push(`- **Green CI run:** ${runLink("failed in CI", info.fixRunUrl)} (${fixCommit})`);
       break;
     case "test_reproduced":
-      lines.push("- **Status:** Red run reproduced — awaiting fix commit CI");
-      if (info.testRunUrl) lines.push(`- **Red run:** [failed as expected](${info.testRunUrl})`);
+      lines.push(
+        `- **Status:** 🟡 Red CI reproduced (\`${info.status}\`) — awaiting fix commit CI`,
+      );
+      lines.push(`- **Red CI run:** ${runLink("failed as expected", info.testRunUrl)} (${redCommit})`);
       break;
     default:
       break;
   }
-  lines.push(PR_BODY_BLOCK_END);
+
+  lines.push(PR_DESCRIPTION_MARKER_END);
   return lines.join("\n");
 }
 
-export function buildUpdatedPrBody(body: string, info: PrBodyUpdate): string {
+export function buildUpdatedPrDescription(
+  body: string,
+  fix: Pick<FixVerificationContext, "testCommitSha" | "fixCommitSha">,
+  info: PrDescriptionUpdate,
+): string {
   let updated = body;
 
   if (info.testRunUrl) {
@@ -208,26 +236,8 @@ export function buildUpdatedPrBody(body: string, info: PrBodyUpdate): string {
     updated = updated.replace(GREEN_RUN_PLACEHOLDER, `passes ([green run](${info.fixRunUrl})).`);
   }
 
-  const hasBlock = updated.includes(PR_BODY_BLOCK_START) && updated.includes(PR_BODY_BLOCK_END);
-
-  if (info.outcome === "verified") {
-    const redLinked = !info.testRunUrl || updated.includes(info.testRunUrl);
-    const greenLinked = !info.fixRunUrl || updated.includes(info.fixRunUrl);
-    if (redLinked && greenLinked && !hasBlock) return updated;
-    return upsertVerificationBlock(updated, buildVerificationBlock(info));
-  }
-
-  if (info.outcome === "test_reproduced") {
-    const redLinked = !info.testRunUrl || updated.includes(info.testRunUrl);
-    if (redLinked && !hasBlock) return updated;
-    return upsertVerificationBlock(updated, buildVerificationBlock(info));
-  }
-
-  if (info.outcome === "guardrail_test_passed" || info.outcome === "fix_failed_ci") {
-    return upsertVerificationBlock(updated, buildVerificationBlock(info));
-  }
-
-  return updated;
+  if (info.outcome === "pending") return updated;
+  return upsertVerificationSection(updated, buildVerificationSection(fix, info));
 }
 
 export async function handleAgentCiResult(
@@ -311,7 +321,7 @@ export async function handleAgentCiResult(
     deps.log("verify: no pull request recorded, skipping comment", { fix: fixId, outcome });
   }
 
-  const shouldUpdatePrBody =
+  const shouldUpdatePrDescription =
     hasPr && (SETTLED_STATUSES.has(target) || runUrls.redRunUrl !== undefined);
   const commented = Boolean(body) && hasPr;
   const markedReadyForReview = outcome === "verified" && hasPr;
@@ -319,9 +329,10 @@ export async function handleAgentCiResult(
   // Claim status atomically first, perform idempotent GitHub writes, and roll back non-terminal
   // source status on failure so transient GitHub errors never lock out retries.
   try {
-    if (shouldUpdatePrBody) {
-      await deps.updatePrBody?.(fix, {
+    if (shouldUpdatePrDescription) {
+      await deps.updatePrDescription?.(fix, {
         outcome,
+        status: target,
         testRunUrl: effectiveTestRunUrl,
         fixRunUrl,
       });
@@ -675,7 +686,7 @@ export function createVerifyDeps(options: VerifyDepsOptions = {}): VerifyDeps {
       if (error) throw new Error(`verify: reverting fix ${fixId} failed: ${error.message}`);
     },
 
-    async updatePrBody(fix, info) {
+    async updatePrDescription(fix, info) {
       if (fix.prNumber === null) return;
       const client = await getClient(fix.installationId);
       const pull = await client.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
@@ -686,7 +697,7 @@ export function createVerifyDeps(options: VerifyDepsOptions = {}): VerifyDeps {
       const { body } = pullRequestSchema.parse(pull.data);
       if (body === undefined) return;
       const currentBody = body ?? "";
-      const nextBody = buildUpdatedPrBody(currentBody, info);
+      const nextBody = buildUpdatedPrDescription(currentBody, fix, info);
       if (nextBody === currentBody) return;
       await client.request("PATCH /repos/{owner}/{repo}/pulls/{pull_number}", {
         owner: fix.owner,
